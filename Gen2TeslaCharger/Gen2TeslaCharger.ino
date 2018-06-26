@@ -32,10 +32,12 @@ uint16_t curset = 0;  // ?BUG? - variable not found in the code
 int  setting = 1;     // Flag to indicate if a entry made to change a setting (setting changed = 1, not changed = 0)
 int incomingByte = 0; // Temporary variable for last byte received via serial port
 int state;            // Charger state (0 = turn chargers off, 1 = turn chargers on, 2 = enable chargers)
-bool bChargerEnabled; // Flag to indicate if chargers are enabled or not (false = not enabled, true = enabled)
+bool bChargerEnabled; // Flag to indicate if chargers are enabled or not (state = 1)(false = not enabled, true = enabled)
+bool bChargerEnabling;// Flag to indicate that chargers are in the process of enabling (state=2 or state=3)
 
-// tcan => time since last incoming CAN message for Elcon or slave charging
-// tboot => time since instruction to startup the modules
+// tcan => time at last incoming CAN message for Elcon or slave charging
+// tboot => time at instruction to startup the modules
+// tlast => time at last status message
 unsigned long slavetimeout, tlast, tcan, tboot = 0;
 
 //*********EVSE VARIABLE   DATA ******************
@@ -51,7 +53,7 @@ volatile uint16_t timehigh, duration = 0;
 volatile uint16_t accurlim = 0;
 volatile int dutycycle = 0;
 
-uint16_t cablelim = 0; // Type 2 cable current limit
+uint16_t cablelim = 0; // Power connection (Type 1 or Type 2) cable current limit
 
 //*********Single or Three Phase Config VARIABLE   DATA ******************
 
@@ -65,6 +67,7 @@ uint16_t modulelimcur, dcaclim = 0;
 uint16_t maxaccur = 16000;            // set maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
 uint16_t maxdccur = 45000;            // max DC current output in mA
 // activemodules = count of modules that are enabled and active
+// slavechargerenable = 0 to not use slave charger, 1 to use slave charger
 int activemodules, slavechargerenable = 0;0
 // For validation checks
 uint16_t maxhiaccur = maxaccur;            // maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
@@ -114,7 +117,7 @@ void setup()
     parameters.version = EEPROM_VERSION;  // Increment the EEPROM_VERSION constant in the Config.H file to force a reloading of the EEPROM stored values
     parameters.can0Speed = 500000;        // CAN0 connects to the internal charger modules
     parameters.can1Speed = 500000;        // CAN1 is exposed externally at the port
-    parameters.currReq = 0;               // max (???) input limit per module, note: 1500 = 1A
+    parameters.currReq = 0;               // max current input limit per module, note: 1500 = 1A
     parameters.enabledChargers = 123;     // enable per phase - 123 is all phases - 3 is just phase 3
     parameters.mainsRelay = 48;           // ?BUG? variable is not referenced in the code
     parameters.autoEnableCharger = 0;     // 1 = enabled, 0 = disabled auto start, with proximity and pilot control; conditions D1 High, > 1amp, ...
@@ -492,7 +495,7 @@ void loop()
   // If more than 500ms, set the flag to shutdown charging - the CAN has timed out
   if (parameters.canControl > 1)
   {
-    // Chargers are enabled (1) or enabling (2)
+    // Chargers are enabled (1) or enabling (2 or 3)
     if (state != 0)
     {
       // 500ms since last tcan setting
@@ -501,28 +504,37 @@ void loop()
         // Shutdown the charger
         state = 0;
         Serial.println();
-        Serial.println("WARNING : CAN (incoming) time-out");
+        Serial.println("WARNING : CAN (incoming) time-out for slave.");
       }
     }
   }
 
   // Test that the Enable line is 12v (CHARGER Switch is ON)
   // ?PENDING? - if scheduled charging, the enable line need not be high
-  // if Enable line OFF, but request to enable chargers or chargers are enabled - set status to shutdown chargers
-  if (digitalRead(DIG_IN_1) == LOW && (state == 1 || state == 2))   
+  // if Enable line OFF, but request to enable chargers, chargers are enabled, or enabling - set status to shutdown chargers
+  if (digitalRead(DIG_IN_1) == LOW && state != 1)   
   {
     // Don't allow chargers to enable OR instruct the chargers to disable
     state = 0;
   }
 
   // Check the state of the chargers vs their enabled status and take action
+  // state 0 : Chargers are not enabled, or if enabled shut them down
+  // state 1 : Chargers are activated, or if not active will be activated
+  // state 2 : Enable the chargers
+  // state 3 : Waiting 500ms after being enabled
+  // Sequence 0 -> 2 -> 3 -> 1 (enabled & activated) -> 0 (shutdown)
+  // bChargerEnabled : chargers are enabled and active
+  // bChargerEnabling : chargers are enabled but not activated
   switch (state)
   {
     // Charger should be in an OFF state or changed to an OFF state
     case 0: 
 
+      // ?PRIOR? - Send the deactivate, disable commands on every loop.  May be required behavior.
+
       // Check that the chargers are currently enabled
-      if (bChargerEnabled == true)
+      if (bChargerEnabled == true || bChargerEnabling == true)
       {
         // Note: In prior versions the deactivate and diasble codes were sent on every loop
         digitalWrite(DIG_OUT_1, LOW);//MAINS OFF
@@ -535,6 +547,7 @@ void loop()
         digitalWrite(CHARGER3_ENABLE, LOW);//disable phase 3 power module
   
         // Flag that the chargers are now OFF
+        bChargerEnabling = false;
         bChargerEnabled = false;
       }
       break;
@@ -543,7 +556,7 @@ void loop()
     case 1:
 
       // Check that the Chargers are currently listed as OFF
-      if (bChargerEnabled == false)
+      if (bChargerEnabled == false && bChargerEnabling == true)
       {      
         // Enable the correct chargers
         switch (parameters.enabledChargers)
@@ -589,6 +602,7 @@ void loop()
         }
         
         // Flag that the chargers are enabled
+        bChargerEnabling = false;
         bChargerEnabled = true;
 
         // Delay 100ms, then signal to switch the mains on (via relay) and activate the EVSE
@@ -600,159 +614,108 @@ void loop()
 
     case 2:
 
-      // ?DEBUG? - This would send an ENABLE on every loop while in status=2 (which lasts 500ms)
+      // ?PRIOR? - Code would send an ENABLE on every loop while in status=2 (which lasts 500ms)
+      // Possible that this was a necessary practice (since CAN messages are not guarenteed delivery)
 
+      // Start the enable process for the selected chargers
+      switch (parameters.enabledChargers)
+      {
+        // Check the most likely case first
+        case 123:
+          digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
+          digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
+          digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
+          break;
+        case 1:
+          digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
+          break;
+        case 2:
+          digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
+          break;
+        case 3:
+          digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
+          break;
+        case 12:
+          digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
+          digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
+          break;
+        case 13:
+          digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
+          digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
+          break;
+
+        case 23:
+          digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
+          digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
+          break;
+
+        default:
+          // if nothing else matches, do the default
+          break;
+      }
+      // Flag that the chargers are in the enabling sequence
+      bChargerEnabling = true;
+      
+      // Set state=3, which will last for 500ms
+      state = 3;
+
+      // DEBUG Should 'tboot' be set here? instead of in multiple other locations?
+      
+      break;    // Missing in prior code, but no ill-effects
+
+    case 3:
       // Check that 500ms has passed since status=2 (signal to start enabling) was set
       if (tboot <  (millis() - 500))
       {
         // After 500ms okay to start the ACTIVATE module process
         state = 1;
       }
-      else 
-      {
-        // Start the enable process for the selected chargers
-        switch (parameters.enabledChargers)
-        {
-          // Check the most likely case first
-          case 123:
-            digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
-            digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
-            digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
-            break;
-          case 1:
-            digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
-            break;
-          case 2:
-            digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
-            break;
-          case 3:
-            digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
-            break;
-          case 12:
-            digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
-            digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
-            break;
-          case 13:
-            digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
-            digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
-            break;
-  
-          case 23:
-            digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
-            digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
-            break;
-  
-          default:
-            // if nothing else matches, do the default
-            break;
-        }
-      }
-      break;    // Missing in prior code, but no ill-effects
+      break;
 
     default:
       // if nothing else matches, do the default
       break;
   }
 
-// MARKER - JeffCooke - Code above revised, below not revised
-
   // Every 500ms output a debug status message
   if (tlast <  (millis() - 500))
   {
+    // mark a new time
     tlast = millis();
+
+    // Only if debug is set
     if (debug != 0)
     {
       Serial.println();
+      Serial.print("[DEBUG] Time = ");
       Serial.print(millis());
-      Serial.print(" State: ");
+      Serial.print(" | State = ");
       Serial.print(state);
-      Serial.print(" Phases : ");
+      Serial.print(" | Phases = ");
       Serial.print(parameters.phaseconfig);
       if (bChargerEnabled)
       {
-        Serial.print(" ON  ");
+        Serial.print(" | Chargers ON");
       }
       else
       {
-        Serial.print(" OFF ");
+        Serial.print(" | Chargers OFF");
       }
       if (digitalRead(DIG_IN_1) == HIGH)
       {
-        Serial.print(" D1 H");
+        Serial.print(" | EnableLine Hi");
       }
       else
       {
-        Serial.print(" D1 L");
-      }
-
-
-      if (bChargerEnabled)
-      {
-        Serial.println();
-        for (int x = 0; x < 3; x++)
-        {
-          Serial.print("  Phase ");
-          Serial.print(x + 1);
-          Serial.print(" Feebback //  AC present: ");
-          Serial.print(ACpres[x]);
-          Serial.print("  AC volt: ");
-          Serial.print(acvolt[x]);
-          Serial.print("  AC cur: ");
-          Serial.print((accur[x] * 0.06666), 2);
-          Serial.print("  ");
-          Serial.print(accur[x]);
-          Serial.print("  DC volt: ");
-          Serial.print(dcvolt[x]);
-          Serial.print("  DC cur: ");
-          Serial.print(dccur[x] * 0.000839233, 2);
-          Serial.print("  Inlet Targ: ");
-          Serial.print(inlettarg[x]);
-          Serial.print("  Temp Lim Cur: ");
-          Serial.print(curtemplim[x]);
-          Serial.print("  ");
-          Serial.print(templeg[0][x]);
-          Serial.print("  ");
-          Serial.print(templeg[1][x]);
-          Serial.print(" EN:");
-          Serial.print(ModEn[x]);
-          Serial.print(" Flt:");
-          Serial.print(ModFlt[x]);
-          Serial.print(" Stat:");
-          Serial.print(ModStat[x], BIN);
-          Serial.println();
-        }
-      }
-      else
-      {
-        Serial.println();
-        Serial.print("Modules Turned OFF");
-        Serial.println();
-      }
-    }
-    if (debugevse != 0)
-    {
-      Serial.println();
-      Serial.print("  Proximity Status : ");
-      switch (Proximity)
-      {
-        case Unconnected:
-          Serial.print("Unconnected");
-          break;
-        case Buttonpress:
-          Serial.print("Button Pressed");
-          break;
-        case Connected:
-          Serial.print("Connected");
-          break;
-
+        Serial.print(" | EnableLine Lo");
       }
       /*
         Serial.print(" AC limit : ");
         Serial.print(accurlim);
       */
-      Serial.print(" Cable Limit: ");
+      Serial.print(" | Cable Limit = ");
       Serial.print(cablelim);
-      Serial.print(" Module Cur Request: ");
+      Serial.print(" | Module Cur Request: ");
       Serial.print(modulelimcur / 1.5, 0);
       /*
         Serial.print(" DC AC Cur Lim: ");
@@ -760,18 +723,90 @@ void loop()
         Serial.print(" Active: ");
         Serial.print(activemodules);
       */
-      Serial.print(" DC total Cur:");
+      Serial.print(" | DC total Cur = ");
       Serial.print(totdccur * 0.005, 2);
-      Serial.print(" DC Setpoint:");
+      Serial.print(" | DC Setpoint = ");
       Serial.print(parameters.voltSet * 0.01, 0);
+      Serial.println();
+
+      if (bChargerEnabled)
+      {
+        for (int x = 0; x < 3; x++)
+        {
+          Serial.print("[CHARGER] Phase = ");
+          Serial.print(x + 1);
+          Serial.print(" | Feebback AC present = ");
+          Serial.print(ACpres[x]);
+          Serial.print(" | AC volt = ");
+          Serial.print(acvolt[x]);
+          Serial.print(" | AC cur = ");
+          Serial.print((accur[x] * 0.06666), 2);
+          Serial.print(" & ");
+          Serial.print(accur[x]);
+          Serial.print(" | DC volt = ");
+          Serial.print(dcvolt[x]);
+          Serial.print(" | DC cur = ");
+          Serial.print(dccur[x] * 0.000839233, 2);
+          Serial.print(" | Inlet Targ = ");
+          Serial.print(inlettarg[x]);
+          Serial.print(" | Temp Lim Cur = ");
+          Serial.print(curtemplim[x]);
+          Serial.print(" & ");
+          Serial.print(templeg[0][x]);
+          Serial.print(" & ");
+          Serial.print(templeg[1][x]);
+          Serial.print(" | EN = ");
+          Serial.print(ModEn[x]);
+          Serial.print(" | Flt = ");
+          Serial.print(ModFlt[x]);
+          Serial.print(" | Stat = ");
+          Serial.print(ModStat[x], BIN);
+          Serial.println();
+        }
+      }
+      else
+      {
+        if (state == 0)
+        {
+          Serial.print("[CHARGER] Modules Turned OFF");
+        }
+        if (state == 2 || state == 3)
+        {
+          Serial.print("[CHARGER] Modules Enabling...");
+        }
+        Serial.println();
+      }
+      if (debugevse != 0)
+      {
+        Serial.println();
+        Serial.print("[EVSE] Proximity Status = ");
+        switch (Proximity)
+        {
+          case Unconnected:
+            Serial.print("Unconnected");
+            break;
+          case Buttonpress:
+            Serial.print("Button Pressed");
+            break;
+          case Connected:
+            Serial.print("Connected");
+            break;
+        }
+        Serial.println();
+      }
     }
   }
+
+  // Check the DC current levels (maintain within limits for the source phases/types)
   DCcurrentlimit();
+
+  // Check the AC current levels (maintain within limits for the source phases/types)
   ACcurrentlimit();
 
-  //EVSE automatic control
-
+  //EVSE automatic control - check the PROXIMITY line and set the cablelim accordingly
   evseread();
+
+  // If in AutoEnableCharger mode, check if the power cable is plugged in, is so start the charging process
   if (parameters.autoEnableCharger == 1)
   {
     if (Proximity == Connected) //check if plugged in
@@ -779,16 +814,21 @@ void loop()
       //digitalWrite(EVSE_ACTIVATE, HIGH);//pull pilot low to indicate ready - NOT WORKING freezes PWM reading
       if (modulelimcur > 1400) // one amp or more active modules
       {
-        if (parameters.autoEnableCharger == 1)
+        // ?REDUNDANT? 
+        //if (parameters.autoEnableCharger == 1)
+        //{
+        if (state == 0)
         {
-          if (state == 0)
+          if (digitalRead(DIG_IN_1) == HIGH)
           {
-            if (digitalRead(DIG_IN_1) == HIGH)
-            {
-              state = 2;// initialize modules
-              tboot = millis();
-            }
+            // Start the process of initializing the modules
+            state = 2;
+
+            // Set a timer recording the start of the initialize request
+            // ??Should this be done in the code that handles the state = 2 request?
+            tboot = millis();
           }
+        //}
         }
       }
       digitalWrite(DIG_OUT_2, HIGH); //enable AC present indication
@@ -797,12 +837,14 @@ void loop()
     {
       state = 0;
       digitalWrite(DIG_OUT_2, LOW); //disable AC present indication
+
+      // ?? Isn't this taken care of in the 'state=0' code ??
       digitalWrite(EVSE_ACTIVATE, LOW);
     }
   }
 }
 
-
+// MARKER - JeffCooke - Code above revised, below not revised
 
 void candecode(CAN_FRAME & frame)
 {
@@ -1148,10 +1190,13 @@ void Charger_msgs()
   }
 }
 
+// Get the PROXIMITY pin value and set the 'cablelim' appropriately, taking into account source 'type'
 void evseread()
 {
   uint16_t val = 0;
   val = analogRead(EVSE_PROX);     // read the input pin
+
+  // Type 2 power source connection
   if ( parameters.type == 2)
   {
     if ( val > 950)
@@ -1180,6 +1225,7 @@ void evseread()
     }
   }
 
+  // Type 1 power source connection (e.g. J1772 USA)
   if ( parameters.type == 1)
   {
     if ( val > 800)
@@ -1218,23 +1264,30 @@ void Pilotcalc()
   }
 }
 
+// Checks for timeout of the pilot signal (more than 1.2secs), if so set the current demand to 0
+// Sets the modulelimcur based on Phases, EVSE or not
+// Checks modulelimcur against limits set in Parameters
 void ACcurrentlimit()
 {
   if (parameters.autoEnableCharger == 1)
   {
-    if (micros() - pilottimer > 1200) //too big a gap in pilot signal kills means signal error or disconnected so no current allowed.
+    //too big a gap in pilot signal means signal error, kill or disconnected so no current allowed
+    if (micros() - pilottimer > 1200) 
     {
       accurlim = 0;
     }
-    if (parameters.phaseconfig == 0)
+
+    // Calculate the modulelimcur per module
+    if (parameters.phaseconfig == Singlephase)
     {
       modulelimcur = (accurlim / 3) * 1.5 ; // all module parallel, sharing AC input current
     }
-    else
+    else // Threephase
     {
       modulelimcur = accurlim * 1.5; // one module per phase, EVSE current limit is per phase
-
     }
+
+    // If Type 2 power source, check if modulelimcur is over limit, and if so set to limit value
     if (parameters.type == 2)
     {
       if (modulelimcur > (cablelim * 1.5))
@@ -1243,40 +1296,47 @@ void ACcurrentlimit()
       }
     }
   }
-  else
+  else    // Not on AutoEnableCharger
   {
-    if (parameters.phaseconfig == 0)
+    if (parameters.phaseconfig == Singlephase)
     {
       modulelimcur = (parameters.currReq / 3); // all module parallel, sharing AC input current
     }
+
+    // ?BUG? I would have expected to see an else to handle Threephase in Not AutoEnableCharger mode ???
+    // Code shows up on the other side of the canControl IF statement ???
   }
+
+  // If in canControl model for Master or ElconMaster
   if (parameters.canControl == 1 |parameters.canControl == 2)
   {
     if (accurlim * 1.5 > (16000 * 1.5)) //enable second charger if current available >15A
     {
       modulelimcur = modulelimcur * 0.5;
       slavechargerenable = 1;
-
     }
     else
     {
       slavechargerenable = 0;
     }
   }
-  if (parameters.phaseconfig == 1)
+  
+  // if evse allows more current then set in parameters limit it
+  if (parameters.phaseconfig == Threephase)
   {
     if (modulelimcur > parameters.currReq) //if evse allows more current then set in parameters limit it
     {
       modulelimcur = parameters.currReq;
     }
   }
-  else
+  else // Singlephase
   {
-    if (modulelimcur > (parameters.currReq / activemodules)) //if evse allows more current then set in parameters limit it
+    if (modulelimcur > (parameters.currReq / activemodules)) 
     {
       modulelimcur = (parameters.currReq / 3);
     }
   }
+  
   /*
     if (modulelimcur > (dcaclim * 1.5)) //if more current then max per module or limited by DC output current
     {
@@ -1285,6 +1345,10 @@ void ACcurrentlimit()
   */
 }
 
+// Set DC Current Limits
+// - Counts the activemodules (looks for modules with >50 acvolts and >50 dcvolts) - '50V must be some kind of minimum'
+// - Totals up the DC current, but then doesn't use the value
+// Sets the value of 'dcaclim' - looks like calculating DC Power (volts * amps), then AC amps (/acvolts), then spread across modules (/activemodules)
 void DCcurrentlimit()
 {
   totdccur = 1; // 0.005Amp
