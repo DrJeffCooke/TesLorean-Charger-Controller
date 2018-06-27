@@ -38,6 +38,7 @@ bool bChargerEnabling;// Flag to indicate that chargers are in the process of en
 // tcan => time at last incoming CAN message for Elcon or slave charging
 // tboot => time at instruction to startup the modules
 // tlast => time at last status message
+// slavetimeout => time at last update of the slave message
 unsigned long slavetimeout, tlast, tcan, tboot = 0;
 
 //*********EVSE VARIABLE   DATA ******************
@@ -67,7 +68,7 @@ uint16_t modulelimcur, dcaclim = 0;
 uint16_t maxaccur = 16000;            // set maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
 uint16_t maxdccur = 45000;            // max DC current output in mA
 // activemodules = count of modules that are enabled and active
-// slavechargerenable = 0 to not use slave charger, 1 to use slave charger
+// slavechargerenable = 0 slave charger not recruited, 1 slave charger recruited (if charge request is > 15A) ; says nothing about slave being present
 int activemodules, slavechargerenable = 0;0
 // For validation checks
 uint16_t maxhiaccur = maxaccur;            // maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
@@ -844,13 +845,15 @@ void loop()
   }
 }
 
-// MARKER - JeffCooke - Code above revised, below not revised
-
+// Decode the Charger's internal CANbus data transmissions
+// Populates data structures for each charger based on received data
 void candecode(CAN_FRAME & frame)
 {
   int x = 0;
   switch (frame.id)
   {
+
+    // Status Messages
     case 0x217: //phase 1 Status message
       ModStat[0] = frame.data.bytes[0];
       break;
@@ -863,15 +866,15 @@ void candecode(CAN_FRAME & frame)
       ModStat[2] = frame.data.bytes[0];
       break;
 
-    case 0x24B: //phase 3 temp message 2
-      curtemplim[2] = frame.data.bytes[0] * 0.234375;
-      newframe = newframe | 1;
-      break;
-
+    // Temp Messages
     case 0x23B: //phase 3 temp message 1
       templeg[0][2] = frame.data.bytes[0] - 40;
       templeg[1][2] = frame.data.bytes[1] - 40;
       inlettarg[2] = frame.data.bytes[5] - 40;
+      newframe = newframe | 1;
+      break;
+    case 0x24B: //phase 3 temp message 2
+      curtemplim[2] = frame.data.bytes[0] * 0.234375;
       newframe = newframe | 1;
       break;
 
@@ -892,12 +895,13 @@ void candecode(CAN_FRAME & frame)
       inlettarg[0] = frame.data.bytes[5] - 40;
       newframe = newframe | 1;
       break;
-    case 0x247: //phase 2 temp message 2
+    case 0x247: //phase 1 temp message 2
       curtemplim[0] = frame.data.bytes[0] * 0.234375;
       newframe = newframe | 1;
       break;
 
-    case 0x207: //phase 2 msg 0x209. phase 3 msg 0x20B
+    // Phase 1 Detail Message
+    case 0x207:
       acvolt[0] = frame.data.bytes[1];
       accur[0] = (uint16_t((frame.data.bytes[5] & 0x7F) << 2) | uint16_t(frame.data.bytes[6] >> 6)) ;
       x = frame.data.bytes[2] & 12;
@@ -929,7 +933,9 @@ void candecode(CAN_FRAME & frame)
       }
       newframe = newframe | 1;
       break;
-    case 0x209: //phase 2 msg 0x209. phase 3 msg 0x20B
+      
+    // Phase 2 Detail Message
+    case 0x209:
       acvolt[1] = frame.data.bytes[1];
       accur[1] = (uint16_t((frame.data.bytes[5] & 0x7F) << 2) | uint16_t(frame.data.bytes[6] >> 6)) ;
       x = frame.data.bytes[2] & 12;
@@ -961,7 +967,9 @@ void candecode(CAN_FRAME & frame)
       }
       newframe = newframe | 1;
       break;
-    case 0x20B: //phase 2 msg 0x209. phase 3 msg 0x20B
+
+    // Phase 3 Detail Message
+    case 0x20B:
       acvolt[2] = frame.data.bytes[1];
       accur[2] = (uint16_t((frame.data.bytes[5] & 0x7F) << 2) | uint16_t(frame.data.bytes[6] >> 6)) ;
       x = frame.data.bytes[2] & 12;
@@ -993,17 +1001,25 @@ void candecode(CAN_FRAME & frame)
       }
       newframe = newframe | 1;
       break;
-    case 0x227: //dc feedback. Phase 1 measured DC battery current and voltage Charger phase 2 msg : 0x229. Charger phase 3 mesg : 0x22B
+
+    // DC Feedback : Measured DC battery current and voltage
+
+    // Phase 1
+    case 0x227:
       dccur[0] = ((frame.data.bytes[5] << 8) + frame.data.bytes[4]) ;//* 0.000839233 convert in rest of code
       dcvolt[0] = ((frame.data.bytes[3] << 8) + frame.data.bytes[2]) * 0.01052864; //we left shift 8 bits to make a 16bit uint.
       newframe = newframe | 2;
       break;
-    case 0x229: //dc feedback. Phase 1 measured DC battery current and voltage Charger phase 2 msg : 0x229. Charger phase 3 mesg : 0x22B
+
+    // Phase 2
+    case 0x229:
       dccur[1] = ((frame.data.bytes[5] << 8) + frame.data.bytes[4]) ;//* 0.000839233 convert in rest of code
       dcvolt[1] = ((frame.data.bytes[3] << 8) + frame.data.bytes[2]) * 0.01052864; //we left shift 8 bits to make a 16bit uint.
       newframe = newframe | 2;
       break;
-    case 0x22B: //dc feedback. Phase 1 measured DC battery current and voltage Charger phase 2 msg : 0x229. Charger phase 3 mesg : 0x22B
+
+    // Phase 3
+    case 0x22B:
       dccur[2] = ((frame.data.bytes[5] << 8) + frame.data.bytes[4]) ;//* 0.000839233 convert in rest of code
       dcvolt[2] = ((frame.data.bytes[3] << 8) + frame.data.bytes[2]) * 0.010528564; //we left shift 8 bits to make a 16bit uint.
       newframe = newframe | 2;
@@ -1015,9 +1031,130 @@ void candecode(CAN_FRAME & frame)
   }
 }
 
+// Decode any CAN frames sent to the charger from other modules (external)
+void canextdecode(CAN_FRAME & frame)
+{
+
+  // 0 = disabled can control, 1 = master, 2 = Elcon master, 3 = slave
+  
+  int x = 0;  // ?PURPOSE?
+  
+  // If charger in Elcon Master mode
+  if (parameters.canControl == 2)
+  {
+    // Check for Elcon Charge Control message
+    if (ElconControlID == frame.id) 
+    {
+      // Pull in charger settings data from the CAN data
+      parameters.voltSet = ((frame.data.bytes[0] << 8) + frame.data.bytes[1]) * 0.1;
+      maxdccur = (frame.data.bytes[2] << 8) + frame.data.bytes[3];
+
+      // Test a databyte flag value
+      if (frame.data.bytes[4] & 0x01 == 1)
+      {
+        // Check if chargers are OFF
+        if (state == 0)
+        {
+          // Start the chargers enabling process
+          state = 2;
+          // Start the clock (marks entry to state=2)
+          tboot = millis();
+        }
+      }
+      else  // Databyte flag was not set
+      {
+        // Shut the chargers down
+        state = 0;
+      }
+
+      // Info if debugging
+      if (candebug == 1)
+      {
+        Serial.println();
+        Serial.print("[CANext] State = ");
+        Serial.print(state);
+        Serial.print(" | Voltage Set = ");
+        Serial.print(parameters.voltSet);
+        Serial.print(" | Module Current Limit = ");
+        Serial.print(modulelimcur);
+        Serial.println();
+      }
+
+      // Mark time since the last external CAN message came in
+      tcan = millis();
+    }
+  }
+
+  // If charger in Slave mode
+  if (parameters.canControl == 3)
+  {
+    // Check for Slave charge control message
+    if (ControlID == frame.id)
+    {
+      // Test a databyte flag
+      if (frame.data.bytes[0] & 0x01 == 1)
+      {
+        // If charger is currently OFF
+        if (state == 0)
+        {
+          // Start the charger enabling process
+          state = 2;
+          // Mark the time of entry to state=2
+          tboot = millis();
+        }
+      }
+      else  // Flag not set
+      { 
+        // If the gap is > 1sec then reset to zero gap, if gap is > 0.5sec then shutdown chargers
+        // ?BUG? ?REDUNDANT? so chargers only shutdown if gap is >0.5sec and <1sec, once over 1sec it won't shutdown
+        // 'tcan' is also checked in the main loop, once gap is >0.5sec, it sets state=0 to shut modules down
+        if(millis()-slavetimeout > 1000)
+        {
+        slavetimeout = millis();
+        }
+        if(millis()-slavetimeout > 500)
+        {
+        state = 0;
+        }
+      }
+
+      // Pull in charger settings data from the CAN data
+      parameters.voltSet = (frame.data.bytes[1] << 8) + frame.data.bytes[2];
+      maxdccur = (frame.data.bytes[3] << 8) + frame.data.bytes[4];
+      modulelimcur  = (frame.data.bytes[5] << 8) + frame.data.bytes[6];
+
+      // Info if debugging
+      if (candebug == 1)
+      {
+        Serial.println();
+        Serial.print("[CANext] State = ");
+        Serial.print(state);
+        Serial.print(" | Voltage Set = ");
+        Serial.print(parameters.voltSet);
+        Serial.print(" | Module Current Limit = ");
+        Serial.print(modulelimcur);
+        Serial.println();
+      }
+
+      // Mark time since the last external CAN message came in
+      tcan = millis();
+    }
+  }
+
+}
+
+// Sends all the OUTGOING CAN messages
+// - Charger internal control and status messages
+// - General charger status message with StatusID
+// - Elcon message (not only in Elcon mode)
+// - DCDC Converter message (if settings indicate, send a target voltage to the Tesla DCDC converter)
+// - If in Master mode, Send out status information with ControlID
+// - If in Master mode, and chargers are ON (state!=0), then send message with ControlID to switch on slave
 void Charger_msgs()
 {
-  CAN_FRAME outframe;  //A structured variable according to due_can library for transmitting CAN data.
+  //Set up a structured variable according to due_can library for transmitting CAN data.
+  CAN_FRAME outframe;  
+  
   /////////////////////This msg addresses all modules/////////////////////////////////////////////////
   outframe.id = 0x045c;            // Set our transmission address ID
   outframe.length = 8;            // Data payload 8 bytes
@@ -1060,11 +1197,13 @@ void Charger_msgs()
   outframe.data.bytes[6] = 0x00;
   outframe.data.bytes[7] = 0x00;
   Can0.sendFrame(outframe);
+  
   //////////////////////////////Phase 2 command message//////////////////////////////////////////////
   outframe.id = 0x43c;        //phase 2 and 3 are copies of phase 1 so no need to set them up again
   Can0.sendFrame(outframe);
+  
   ///////////////////////////////Phase 3 command message/////////////////////////////////////////////
-  outframe.id = 0x44c;
+  outframe.id = 0x44c;        //phase 2 and 3 are copies of phase 1 so no need to set them up again
   Can0.sendFrame(outframe);
 
   ///////////Static Frame every 100ms///////////////////////////////////////////////////////////////////
@@ -1081,25 +1220,35 @@ void Charger_msgs()
   outframe.data.bytes[6] = 0x40;
   outframe.data.bytes[7] = 0xff;
   Can0.sendFrame(outframe);
+  
   /*////////////////////////////////////////////////////////////////////////////////////////////////////////
-    External CAN
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+            External CAN
+  ////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+  // Temp total variables for DCvoltage and ACcurrent
   uint16_t y, z = 0;
+
+  // When not in Slave mode
   outframe.id = StatusID;
+  // If in Slave Mode change the status ID (++)
   if (parameters.canControl == 3)
   {
     outframe.id = StatusID + 1;
   }
+
+  // Data frame settings
   outframe.length = 8;            // Data payload 8 bytes
   outframe.extended = 0;          // Extended addresses - 0=11-bit 1=29bit
   outframe.rtr = 0;                 //No request
-  outframe.data.bytes[0] = 0x00;
+
+  // Populate the DC voltage data
+  outframe.data.bytes[0] = 0x00;  // ?BUG? This gets replaced directly after the loop in all cases
   for (int x = 0; x < 3; x++)
   {
     y = y +  dcvolt[x] ;
   }
   outframe.data.bytes[0] = y / 3;
 
+  // Populate the AC current data
   if (parameters.phaseconfig == Singlephase)
   {
     for (int x = 0; x < 3; x++)
@@ -1111,10 +1260,10 @@ void Charger_msgs()
   {
     z = accur[2] * 66.66;
   }
-
   outframe.data.bytes[1] = lowByte (z);
   outframe.data.bytes[2] = highByte (z);
 
+  // Populate DCcurrent, Module current limit, Promixity status, Connection type
   outframe.data.bytes[3] = lowByte (uint16_t (totdccur)); //0.005Amp
   outframe.data.bytes[4] = highByte (uint16_t (totdccur));  //0.005Amp
   outframe.data.bytes[5] = lowByte (uint16_t (modulelimcur * 0.66666));
@@ -1126,12 +1275,12 @@ void Charger_msgs()
 
   /////////Elcon Message////////////
 
+  // ?PURPOSE? This is sent JUST IN CASE there is an Elcon controller
   outframe.id = ElconID;
   outframe.length = 8;            // Data payload 8 bytes
   outframe.extended = 1;          // Extended addresses - 0=11-bit 1=29bit
   outframe.rtr = 0;                 //No request
-
-
+  // Populate with DCvoltage (y) and total dc current
   outframe.data.bytes[0] = highByte (y * 10 / 3);
   outframe.data.bytes[1] = lowByte (y * 10 / 3);
   outframe.data.bytes[2] = highByte (uint16_t (totdccur * 20)); //0.005Amp conv to 0.1
@@ -1142,8 +1291,8 @@ void Charger_msgs()
   outframe.data.bytes[7] = 0x00;
   Can1.sendFrame(outframe);
 
-
   ///DCDC CAN//////////////////////////////////////////////////////////////////////
+  // Check if setting indicate that Charger should set the DCDC voltage (Tesla DCDC Converter only)
   if (dcdcenable)
   {
     outframe.id = 0x3D8;
@@ -1151,6 +1300,7 @@ void Charger_msgs()
     outframe.extended = 0;          // Extended addresses - 0=11-bit 1=29bit
     outframe.rtr = 0;                 //No request
 
+    // Populate with the target DC voltage for the DCDC converter
     outframe.data.bytes[0] = highByte (uint16_t((parameters.dcdcsetpoint - 9000) / 68.359375) << 6);
     outframe.data.bytes[1] = lowByte (uint16_t((parameters.dcdcsetpoint - 9000) / 68.359375) << 6);
 
@@ -1161,6 +1311,7 @@ void Charger_msgs()
 
   ////////////////////////////////////////////////////////////////////
 
+  // Check if in Master mode
   if (parameters.canControl == 1)
   {
     outframe.id = ControlID;
@@ -1168,16 +1319,21 @@ void Charger_msgs()
     outframe.extended = 0;          // Extended addresses - 0=11-bit 1=29bit
     outframe.rtr = 0;                 //No request
 
+    // Set the default byte 0 value
     outframe.data.bytes[0] = 0;
 
+    // If charger is ON (enabling, enabled, or activated)
     if (state != 0)
     {
-      if ( slavechargerenable == 1)
+      // If Slave charger has been recruited (charge request > 15A), doesn't check to see if slave charge is present
+      if (slavechargerenable == 1)
       {
+        // Set flag for Slave charger (to switch on the Slave)
         outframe.data.bytes[0] = 0x01;
       }
     }
 
+    // Populate with voltage, max DC current, module current limit
     outframe.data.bytes[1] = highByte(parameters.voltSet);
     outframe.data.bytes[2] = lowByte(parameters.voltSet);
     outframe.data.bytes[3] = highByte(maxdccur);
@@ -1246,13 +1402,18 @@ void evseread()
   }
 }
 
+// Just a shell function
 void Pilotread()
 {
   Pilotcalc();
 }
 
+// ?CHECK? - if it works correctly it is a very clever routine
+// Calculates the AC Current Limit from the duty cyle of the PILOT line
+// keeps updating 'duration since last high read', the when it goes low then calculates duty cyle
 void Pilotcalc()
 {
+  // If the PILOT is high, just calc time since last checked HIGH, else if LOW ???
   if (  digitalRead(EVSE_PILOT ) == HIGH)
   {
     duration = micros() - pilottimer;
@@ -1260,7 +1421,8 @@ void Pilotcalc()
   }
   else
   {
-    accurlim = (micros() - pilottimer) * 100 / duration * 600; //Calculate the duty cycle then multiply by 600 to get mA current limit
+    //Calculate the duty cycle then multiply by 600 to get mA current limit
+    accurlim = (micros() - pilottimer) * 100 / duration * 600; 
   }
 }
 
@@ -1313,10 +1475,13 @@ void ACcurrentlimit()
     if (accurlim * 1.5 > (16000 * 1.5)) //enable second charger if current available >15A
     {
       modulelimcur = modulelimcur * 0.5;
+
+      // Enable the slave charger to assist with charging, gets sent CAN frame to startup
       slavechargerenable = 1;
     }
     else
     {
+      // Disable the slave charger from assisting with charging, gets sent CAN frame to stop
       slavechargerenable = 0;
     }
   }
@@ -1366,82 +1531,4 @@ void DCcurrentlimit()
   dcaclim = ((dcvolt[x] * (maxdccur + 400)) / acvolt[x]) / activemodules;
 }
 
-void canextdecode(CAN_FRAME & frame)
-{
-  int x = 0;
-  if (parameters.canControl == 2)
-  {
-    if (ElconControlID == frame.id) //Charge Control message
-    {
-      parameters.voltSet = ((frame.data.bytes[0] << 8) + frame.data.bytes[1]) * 0.1;
-      maxdccur = (frame.data.bytes[2] << 8) + frame.data.bytes[3];
-
-      if (frame.data.bytes[4] & 0x01 == 1)
-      {
-        if (state == 0)
-        {
-          state = 2;
-          tboot = millis();
-        }
-      }
-      else
-      {
-        state = 0;
-      }
-      if (candebug == 1)
-      {
-        Serial.println();
-        Serial.print( state);
-        Serial.print(" ");
-        Serial.print(parameters.voltSet);
-        Serial.print(" ");
-        Serial.print(modulelimcur);
-        Serial.println();
-      }
-      tcan = millis();
-    }
-  }
-
-  if (parameters.canControl == 3)
-  {
-    if (ControlID == frame.id) //Charge Control message
-    {
-      if (frame.data.bytes[0] & 0x01 == 1)
-      {
-        if (state == 0)
-        {
-          state = 2;
-          tboot = millis();
-        }
-      }
-      else
-      { 
-        if(millis()-slavetimeout > 1000)
-        {
-        slavetimeout = millis();
-        }
-        if(millis()-slavetimeout > 500)
-        {
-        state = 0;
-        }
-      }
-      parameters.voltSet = (frame.data.bytes[1] << 8) + frame.data.bytes[2];
-      maxdccur = (frame.data.bytes[3] << 8) + frame.data.bytes[4];
-      modulelimcur  = (frame.data.bytes[5] << 8) + frame.data.bytes[6];
-      if (candebug == 1)
-      {
-        Serial.println();
-        Serial.print( state);
-        Serial.print(" ");
-        Serial.print(parameters.voltSet);
-        Serial.print(" ");
-        Serial.print(modulelimcur);
-        Serial.println();
-      }
-
-      tcan = millis();
-    }
-  }
-
-}
 
