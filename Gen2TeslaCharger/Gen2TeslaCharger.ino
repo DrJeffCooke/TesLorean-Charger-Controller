@@ -34,7 +34,6 @@ int incomingByte = 0; // Temporary variable for last byte received via serial po
 int state;            // Charger state (0 = turn chargers off, 1 = turn chargers on, 2 = enable chargers)
 bool bChargerEnabled; // Flag to indicate if chargers are enabled or not (state = 1)(false = not enabled, true = enabled)
 bool bChargerEnabling;// Flag to indicate that chargers are in the process of enabling (state=2 or state=3)
-
 // tcan => time at last incoming CAN message for Elcon or slave charging
 // tboot => time at instruction to startup the modules
 // tlast => time at last status message
@@ -42,28 +41,27 @@ bool bChargerEnabling;// Flag to indicate that chargers are in the process of en
 unsigned long slavetimeout, tlast, tcan, tboot = 0;
 
 //*********EVSE VARIABLE   DATA ******************
-byte Proximity = 0;   // Proximity line enumeration (see below) : voltage set by EVSE, but depends on Type 1 or Type 2
 uint16_t ACvoltIN = 240; // AC input voltage 240VAC for EU/UK and 110VAC for US
+// Proximity EVSE variables
+byte Proximity = 0;   // Proximity line enumeration (see below) : voltage set by EVSE, but depends on Type 1 or Type 2
 //proximity status values for type 1
 #define Unconnected 0 // 3.3V
 #define Buttonpress 1 // 2.3V
 #define Connected 2 // 1.35V
-
-volatile uint32_t pilottimer = 0;
-volatile uint16_t timehigh, duration = 0;
-volatile uint16_t accurlim = 0;
-volatile int dutycycle = 0;
-
-uint16_t cablelim = 0; // Power connection (Type 1 or Type 2) cable current limit
+uint16_t cablelim = 0; // Power connection (Type 2 only) cable limit as indicated by Proximity
+// Pilot EVSE variables
+volatile uint32_t pilottimer = 0;         // Used to calculate the duty cycle on the Pilot line, duty cycle indicates AC current limit
+volatile uint16_t timehigh, duration = 0; // 'timehigh' is an unused variable, 'duration' is used in Pilot duty cycle calculation
+volatile uint16_t accurlim = 0;           // AC current limit calculated from the Pilot line
+volatile int dutycycle = 0;               // Calculated duty cycle of the Pilot line
 
 //*********Single or Three Phase Config VARIABLE   DATA ******************
-
-//proximity status values
+// Power Source configuration
 #define Singlephase 0 // all parallel on one phase Type 1
-#define Threephase 1 // one module per phase Type 2
+#define Threephase 1  // one module per phase Type 2
 
 //*********Charger Control VARIABLE   DATA ******************
-bool Vlimmode = true;                 // Set charges to voltage limit mode
+bool Vlimmode = true;                 // ?UNUSED? - Set charges to voltage limit mode
 uint16_t modulelimcur, dcaclim = 0;
 uint16_t maxaccur = 16000;            // set maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
 uint16_t maxdccur = 45000;            // max DC current output in mA
@@ -72,67 +70,74 @@ uint16_t maxdccur = 45000;            // max DC current output in mA
 int activemodules, slavechargerenable = 0;0
 // For validation checks
 uint16_t maxhiaccur = maxaccur;            // maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
-uint16_t maxhidccur = maxdccur;            // set to 45amps; maximum limit DC current output in mA
-uint16_t maxhivolts = 40000;            // set to 400v; maximum limit Voltage in 0.01V (hundreds of a volt)
+uint16_t maxhidccur = maxdccur;            // maximum limit DC current output in mA
+uint16_t maxhivolts = 40000;               // set to 400v; maximum limit Voltage in 0.01V (hundreds of a volt)
 
 //*********Feedback from charge VARIABLE   DATA ******************
-uint16_t dcvolt[3] = {0, 0, 0};//1 = 1V
-uint16_t dccur[3] = {0, 0, 0};
-uint16_t totdccur = 0;//1 = 0.005Amp
-uint16_t acvolt[3] = {0, 0, 0};//1 = 1V
-uint16_t accur[3] = {0, 0, 0};//1 = 0.06666 Amp
-long acpower = 0;
-byte inlettarg [3] = {0, 0, 0}; //inlet target temperatures, should be used to command cooling.
-byte curtemplim [3] = {0, 0, 0};//current limit due to temperature
+uint16_t dcvolt[3] = {0, 0, 0};       //DC Voltage, 1 = 1V
+uint16_t dccur[3] = {0, 0, 0};        //DC Current
+uint16_t totdccur = 0;                //Total DC Current, 1 = 0.005Amp
+uint16_t acvolt[3] = {0, 0, 0};       //AC Voltage, 1 = 1V
+uint16_t accur[3] = {0, 0, 0};        //AC Current, 1 = 0.06666 Amp
+long acpower = 0;                     // ?UNUSED?
+byte inlettarg [3] = {0, 0, 0};       //inlet target temperatures, should be used to command cooling.
+byte curtemplim [3] = {0, 0, 0};      //current limit due to temperature
 byte templeg[2][3] = {{0, 0, 0}, {0, 0, 0}}; //temperatures reported back
-bool ACpres [3] = {0, 0, 0}; //AC present detection on the modules
-bool ModEn [3] = {0, 0, 0}; //Module enable feedback on the modules
-bool ModFlt [3] = {0, 0, 0}; //module fault feedback
-byte ModStat [3] = {0, 0, 0};//Module Status
-int newframe = 0;
+bool ACpres [3] = {0, 0, 0};          //AC present detection on the modules {true, false}
+bool ModEn [3] = {0, 0, 0};           //Module enable feedback on the modules {true, false}
+bool ModFlt [3] = {0, 0, 0};          //module fault feedback {true, false}
+byte ModStat [3] = {0, 0, 0};         //Module Status {binary}
+int newframe = 0;                     // bit0=1 if temp reported/detail message, bit1=1 if  DC feedback reported, value is never used
 
+// Record variable used to hold the EEPROM variable values
 ChargerParams parameters;
 
 //*********DCDC Messages VARIABLE   DATA ******************
-bool dcdcenable = 1; // turn on can messages for the DCDC.(Tesla DCDC specific), voltage set to parameters.dcdcsetpoint
+bool dcdcenable = 1; // 1=ON, 0=OFF, CAN messages for the DCDC.(Tesla DCDC specific), voltage specified by parameters.dcdcsetpoint
 
 //*********Charger Messages VARIABLE   DATA ******************
-int ControlID = 0x300;
-int StatusID = 0x410;
+int ControlID = 0x300;      // Internal charger frame ID for control
+int StatusID = 0x410;       // Internal charger frame ID for status
+
 //ELCON specific - not used in TesLorean
 unsigned long ElconID = 0x18FF50E5;
 unsigned long ElconControlID = 0x1806E5F4;
 
 void setup()
 {
+  // Start the USB port communciations
   Serial.begin(115200);  //Initialize our USB port which will always be redefined as SerialUSB to use the Native USB port tied directly to the SAM3X processor.
 
+  // Output a Charger 'keep alive' message 10 times a second
   Timer3.attachInterrupt(Charger_msgs).start(90000); // charger messages every 100ms
 
+  // Run the Pilotread() function if the PILOT line value changes
   attachInterrupt(EVSE_PILOT, Pilotread , CHANGE);
 
   Wire.begin();
+
+  // Read the EEPROM and populate the 'parameters' record
   EEPROM.read(0, parameters);
-  if (parameters.version != EEPROM_VERSION)
+  if (parameters.version != EEPROM_VERSION)   // Check that EEPROM data is a different version from the data in Config.H
   {
     parameters.version = EEPROM_VERSION;  // Increment the EEPROM_VERSION constant in the Config.H file to force a reloading of the EEPROM stored values
     parameters.can0Speed = 500000;        // CAN0 connects to the internal charger modules
     parameters.can1Speed = 500000;        // CAN1 is exposed externally at the port
     parameters.currReq = 0;               // max current input limit per module, note: 1500 = 1A
     parameters.enabledChargers = 123;     // enable per phase - 123 is all phases - 3 is just phase 3
-    parameters.mainsRelay = 48;           // ?BUG? variable is not referenced in the code
-    parameters.autoEnableCharger = 0;     // 1 = enabled, 0 = disabled auto start, with proximity and pilot control; conditions D1 High, > 1amp, ...
-    parameters.canControl = 0;            // 0 = disabled can control, 1 = master, 2 = Elcon master, 3 = slave
-    parameters.dcdcsetpoint = 14000;      // voltage setpoint for DCDC Converter in mv (sent via external CAN)
+    parameters.mainsRelay = 48;           // ?BUG? variable is not referenced in the code. It may refer to the line on the microcontroller that outputs to the main s relay
+    parameters.autoEnableCharger = 0;     // 1 = enabled, 0 = disabled auto start, with proximity and pilot control
+    parameters.canControl = 0;            // 0 = disabled can control, or in the following modes 1 = master, 2 = Elcon master, 3 = slave
+    parameters.dcdcsetpoint = 14000;      // voltage setpoint for DCDC Converter in mv (sent via external CAN to DCDC)
     
     // TesLorean COnfiguration
-    parameters.voltSet = maxhivolts;           // 1 = 0.01V
+    parameters.voltSet = maxhivolts;      // 1 = 0.01V
     parameters.phaseconfig = Singlephase; //AC input configuration (US=Singlephase, EU=Threephase)
     parameters.type = 1;                  // Socket type1 or 2. Note Type 1 is J1772 USA
-    EEPROM.write(0, parameters);
+    EEPROM.write(0, parameters);          // Write the values out to the EEPROM
   }
 
-  // Initialize CAN ports
+  // ///////////// Initialize CAN ports ////////////////////////////
   if (Can1.begin(parameters.can1Speed, 255)) //can1 external bus
   {
     Serial.println("Using CAN1 - initialization completed.\n");
@@ -160,9 +165,6 @@ void setup()
     Can0.setRXFilter(filter, 0, 0, false);
     Can1.setRXFilter(filter, 0, 0, false);
   }
-  ///////////////////CHARGER ENABLE AND ACTIVATE LINES///////////////////////////////////
-
-  //////////////////////////////////////////////////////////////////////////////////////
 
   ///////////////////CHARGER ENABLE AND ACTIVATE LINES///////////////////////////////////
   pinMode(LED_BUILTIN, OUTPUT);
@@ -172,14 +174,12 @@ void setup()
   pinMode(CHARGER1_ACTIVATE, OUTPUT); //CHG1 ACTIVATE
   pinMode(CHARGER2_ACTIVATE, OUTPUT);  //CHG2 ACTIVATE
   pinMode(CHARGER3_ACTIVATE, OUTPUT); //CHG3 ACTIVATE
+
   //////////////////////////////////////////////////////////////////////////////////////
-
-
   pinMode(DIG_IN_1, INPUT); //IP1
   pinMode(DIG_IN_2, INPUT); //IP2
-  //////////////////////////////////////////////////////////////////////////////////////
 
-  //////////////DIGITAL OUTPUTS MAPPED TO X046. 10 PIN CONNECTOR ON LEFT//////////////////////////////////////////
+  //////////////DIGITAL OUTPUTS MAPPED TO X046. 10 PIN CONNECTOR ON LEFT////////////////
   pinMode(DIG_OUT_1, OUTPUT); //OP1 - X046 PIN 6
   pinMode(DIG_OUT_2, OUTPUT); //OP2
   pinMode(DIG_OUT_3, OUTPUT); //OP2
