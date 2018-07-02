@@ -31,7 +31,7 @@ int candebug = 1;   // show CAN updates and timeouts
 uint16_t curset = 0;  // ?BUG? - variable not found in the code
 int  setting = 1;     // Flag to indicate if a entry made to change a setting (setting changed = 1, not changed = 0)
 int incomingByte = 0; // Temporary variable for last byte received via serial port
-int state;            // Charger state (0 = turn chargers off, 1 = turn chargers on, 2 = enable chargers)
+int state;            // Charger state (0 = turn chargers off, 1 = turn chargers on, 2 = enable chargers, 3 = waiting for chargers to enable)
 bool bChargerEnabled; // Flag to indicate if chargers are enabled or not (state = 1)(false = not enabled, true = enabled)
 bool bChargerEnabling;// Flag to indicate that chargers are in the process of enabling (state=2 or state=3)
 // tcan => time at last incoming CAN message for Elcon or slave charging
@@ -66,8 +66,8 @@ uint16_t modulelimcur, dcaclim = 0;
 uint16_t maxaccur = 16000;            // set maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
 uint16_t maxdccur = 45000;            // max DC current output in mA
 // activemodules = count of modules that are enabled and active
-// slavechargerenable = 0 slave charger not recruited, 1 slave charger recruited (if charge request is > 15A) ; says nothing about slave being present
-int activemodules, slavechargerenable = 0;0
+// slavechargerenable = 0 slave charger not recruited, 1 slave charger recruited (if charge request is > 15A), says nothing about slave being present
+int activemodules, slavechargerenable = 0;
 // For validation checks
 uint16_t maxhiaccur = maxaccur;            // maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
 uint16_t maxhidccur = maxdccur;            // maximum limit DC current output in mA
@@ -99,17 +99,37 @@ bool dcdcenable = 1; // 1=ON, 0=OFF, CAN messages for the DCDC.(Tesla DCDC speci
 int ControlID = 0x300;      // Internal charger frame ID for control
 int StatusID = 0x410;       // Internal charger frame ID for status
 
-//ELCON specific - not used in TesLorean
+//********** ELCON specific - not used in TesLorean ************
 unsigned long ElconID = 0x18FF50E5;
 unsigned long ElconControlID = 0x1806E5F4;
 
+//********** DCDC CAN ***************
+int DCDCConverterControlID = 0x3D8;       // Frame ID for CAN instructions to the Tesla DCDC converter
+
+//********* Charger Outgoing Status and Control CAN **************
+int TesLoreanChargerID = 0x2B0;     // Internal charger frame ID for controller comms with TesLorean
+int FastCycleCountLimit = 9;        // How many 100ms cycles
+int TesLoreanFastCycleCount = 0;    // Counts in 100ms gaps, in a 0-9 cycle, so rolls over every 1 sec
+int SlowCycleCountLimit = 99;        // How many 100ms cycles
+int TesLoreanSlowCycleCount = 0;    // Counts in 100ms gaps, in a 0-99 cycle, so rolls over every 10 secs
+int VSlowCycleCountLimit = 299;        // How many 100ms cycles
+int TesLoreanVSlowCycleCount = 0;    // Counts in 100ms gaps, in a 0-2999 cycle, so rolls over every 30 secs
+
+// SETUP TASKS
+// 1. Initialize the USB port (takes commands and outputs debug and status messages)
+// 2. Set up the ChargerMessages to output ever 100ms
+// 2. Set up the Pilot interrupt (pilot changes signal EVSE voltage allowance via Duty Cyle calcs)
+// 3. Read parameters from the EEPROM, if a new version is provided update the EEPROM from values in code
+// 4. Initialize CAN0 (internal to charger) and CAN1 (external to charger) ports
+// 5. Set up the microcontroller's pin mapping to the charge modules and to the external data ports
+// 6. Initialize the charger status flag
 void setup()
 {
   // Start the USB port communciations
   Serial.begin(115200);  //Initialize our USB port which will always be redefined as SerialUSB to use the Native USB port tied directly to the SAM3X processor.
 
   // Output a Charger 'keep alive' message 10 times a second
-  Timer3.attachInterrupt(Charger_msgs).start(90000); // charger messages every 100ms
+  Timer3.attachInterrupt(Charger_msgs).start(90000); // charger messages every 100ms (probably 90ms to allow for run time)
 
   // Run the Pilotread() function if the PILOT line value changes
   attachInterrupt(EVSE_PILOT, Pilotread , CHANGE);
@@ -128,6 +148,7 @@ void setup()
     parameters.mainsRelay = 48;           // ?BUG? variable is not referenced in the code. It may refer to the line on the microcontroller that outputs to the main s relay
     parameters.autoEnableCharger = 0;     // 1 = enabled, 0 = disabled auto start, with proximity and pilot control
     parameters.canControl = 0;            // 0 = disabled can control, or in the following modes 1 = master, 2 = Elcon master, 3 = slave
+                                          // Master mode also accommodates a Slave charger (i.e. sends Slave CAN instructions every 100ms)
     parameters.dcdcsetpoint = 14000;      // voltage setpoint for DCDC Converter in mv (sent via external CAN to DCDC)
     
     // TesLorean COnfiguration
@@ -152,6 +173,7 @@ void setup()
   }
   else Serial.println("CAN0 initialization (sync) ERROR\n");
 
+  // Clear (by setting blank) all the filters on the CAN data, i.e. no frames get summarily rejected
   int filter;
   //extended
   for (filter = 0; filter < 3; filter++)
@@ -187,11 +209,24 @@ void setup()
   pinMode(EVSE_ACTIVATE, OUTPUT); //pull Pilot to 6V
   ///////////////////////////////////////////////////////////////////////////////////////
 
+  // Set the maximum AC current (note maxaccur
   dcaclim = maxaccur;
 
   bChargerEnabled = false; //  ?FIXED? are we supposed to command the charger to charge?
 }
 
+// MAIN LOOP TASKS
+// 1. Check for internal CAN data frame and process
+// 2. Check for external CAN data frame and process
+// 3. Check for Serial data, adjust data and flag that a change occurred
+// 4. If setting was changed (most likely via serial port) output a detailed reflection
+// 5. Check if settings changed, the use STATUS as indicator of the mode the charge modules should be in
+// ... status 0 => shutdown the charging, status 2 => enable chargers, status 3 => wait defined time, status 1 => activate chargers
+// 6. Output debug and status information (on a regular time interval)
+// 7. Check the DC Current is within limits, if not modify
+// 8. Check the AC Current is within limits, if not modify
+// 9. Check the Proximity setting and update the connection status as necessary
+// 10. Handle AutoCharging (if cable plugged in, the start sequence to start up chargers)
 void loop()
 {
   CAN_FRAME incoming;
@@ -375,7 +410,7 @@ void loop()
         if (Serial.available() > 0)
         {
           // Test for a valid digits string (as integer) and then update setting, otherwise error
-          uint8_t  tempCs
+          uint8_t  tempCs;
           tempCs = Serial.parseInt();
           if (tempCs == 1 || tempCs == 2 || tempCs == 3 || tempCs == 12 || tempCs == 13 || tempCs == 23 || tempCs == 123)
           {
@@ -427,7 +462,7 @@ void loop()
 
     // Two blank lines
     Serial.println();
-    Serial.println(NEW PARAMETERS...);
+    Serial.println("NEW PARAMETERS...");
 
     if (state == 1)
     {
@@ -1034,10 +1069,56 @@ void candecode(CAN_FRAME & frame)
 // Decode any CAN frames sent to the charger from other modules (external)
 void canextdecode(CAN_FRAME & frame)
 {
-
+  // canControl modes
   // 0 = disabled can control, 1 = master, 2 = Elcon master, 3 = slave
   
   int x = 0;  // ?PURPOSE?
+
+// UNDERDEV
+  // If charger in Master mode (so it can take CAN commands from the external port)
+  if (parameters.canControl == 1)
+  {
+    // CAN Instruction for charger settings and On/Off
+    if (frame.id == (TesLoreanChargerID + 6));
+    {
+      // Instructions to charger to shutdown, startup, or switch into automatic charging mode
+      if (frame.data.bytes[0]==0)     // OFF
+      {
+        if (state != 0)
+        {
+          // Switch the Charger off // Disable Auto Charging
+          state = 0;                              // shutdown modules
+          parameters.autoEnableCharger = 0;       // Disable Auto Charging
+          setting = 1;
+        }
+      }
+      if (frame.data.bytes[0]==1)     // ON
+      {
+        if (state == 0)
+        {
+          // Switch the Charger on // Disable Auto Charging
+          state = 2;          // Start the process of enabling and activating the modules
+          tboot = millis();   // Set the time at which the 'start' 'stop' command was issued
+          parameters.autoEnableCharger = 0;       // Disable Auto Charging
+          setting = 1;
+        }
+      }
+      if (frame.data.bytes[0]==2)     // AUTO, shutdown any charging
+      {
+        // Switch the Charger into AutoCharging mode
+        if (state != 0)
+        {
+          // Switch the Charger off // Disable Auto Charging
+          state = 0;                              // shutdown modules
+        }
+        parameters.autoEnableCharger = 0;       // Disable Auto Charging
+        setting = 1;
+      }
+      // Note: Considered DC AC VOlts/Current settings via CAN, but very unlikely to be used, and can be done via USB
+      // or in code. In the TesLorean it is likely to just be the Trip Computer telling the unit to charge
+      // during a scheduled charging event
+    }
+  }
   
   // If charger in Elcon Master mode
   if (parameters.canControl == 2)
@@ -1085,7 +1166,7 @@ void canextdecode(CAN_FRAME & frame)
     }
   }
 
-  // If charger in Slave mode
+  // If THIS charger is in Slave mode
   if (parameters.canControl == 3)
   {
     // Check for Slave charge control message
@@ -1140,7 +1221,6 @@ void canextdecode(CAN_FRAME & frame)
       tcan = millis();
     }
   }
-
 }
 
 // Sends all the OUTGOING CAN messages
@@ -1150,10 +1230,35 @@ void canextdecode(CAN_FRAME & frame)
 // - DCDC Converter message (if settings indicate, send a target voltage to the Tesla DCDC converter)
 // - If in Master mode, Send out status information with ControlID
 // - If in Master mode, and chargers are ON (state!=0), then send message with ControlID to switch on slave
+// JEC - Comment out the Elcon code (not required)
+// JEC - Provide Counters to prevent flooding the external CAN with status messages (some messages wait until the interrupt has fired X times before sending)
 void Charger_msgs()
 {
   //Set up a structured variable according to due_can library for transmitting CAN data.
-  CAN_FRAME outframe;  
+  CAN_FRAME outframe;
+
+  // Update the TesLorean Fast/Slow counters and set flags for use in this routine
+  bool FastRollover = false;
+  bool SlowRollover = false;
+  bool VSlowRollover = false;
+  TesLoreanFastCycleCount++;
+  if (TesLoreanFastCycleCount > FastCycleCountLimit)    // 100*100ms = 1 sec
+  {
+    TesLoreanFastCycleCount = 0;
+    FastRollover = true;
+  }
+  TesLoreanSlowCycleCount++;
+  if (TesLoreanSlowCycleCount > SlowCycleCountLimit)    // 100*100ms = 10 sec
+  {
+    TesLoreanSlowCycleCount = 0;
+    SlowRollover = true;
+  }
+  TesLoreanVSlowCycleCount++;
+  if (TesLoreanVSlowCycleCount > VSlowCycleCountLimit)    // 300*100ms = 30 sec
+  {
+    TesLoreanVSlowCycleCount = 0;
+    VSlowRollover = true;
+  }
   
   /////////////////////This msg addresses all modules/////////////////////////////////////////////////
   outframe.id = 0x045c;            // Set our transmission address ID
@@ -1224,6 +1329,9 @@ void Charger_msgs()
   /*////////////////////////////////////////////////////////////////////////////////////////////////////////
             External CAN
   ////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+  
+  //// GENERAL STATUS MESSAGE /////////////////////////
+
   // Temp total variables for DCvoltage and ACcurrent
   uint16_t y, z = 0;
 
@@ -1241,7 +1349,7 @@ void Charger_msgs()
   outframe.rtr = 0;                 //No request
 
   // Populate the DC voltage data
-  outframe.data.bytes[0] = 0x00;  // ?BUG? This gets replaced directly after the loop in all cases
+  outframe.data.bytes[0] = 0x00;  // ?REDUNDANT? This gets replaced directly after the loop in all cases
   for (int x = 0; x < 3; x++)
   {
     y = y +  dcvolt[x] ;
@@ -1268,13 +1376,104 @@ void Charger_msgs()
   outframe.data.bytes[4] = highByte (uint16_t (totdccur));  //0.005Amp
   outframe.data.bytes[5] = lowByte (uint16_t (modulelimcur * 0.66666));
   outframe.data.bytes[6] = highByte (uint16_t (modulelimcur * 0.66666));
+  // Write to same byte to apply multiple values (bits) within byte
   outframe.data.bytes[7] = 0x00;
   outframe.data.bytes[7] = Proximity << 6;
   outframe.data.bytes[7] = outframe.data.bytes[7] || (parameters.type << 4);
   Can1.sendFrame(outframe);
 
-  /////////Elcon Message////////////
+  //// CHARGER STATUS INFO ////
+  //// Charging Status Info - TesLorean ////
+  outframe.id = TesLoreanChargerID + 7;
+  outframe.length = 8;            // Data payload 8 bytes
+  outframe.extended = 0;          // Extended addresses - 0=11-bit 1=29bit
+  outframe.rtr = 0;                 //No request
 
+  // Picked up by the instrument cluster controller and trip computer
+  if (state >= 2) // 0 = Inactive, 1 = Active, 2 = Activating
+  {
+    outframe.data.bytes[0] = 2;  
+  }
+  else
+  {
+    outframe.data.bytes[0] = state;  
+  }
+  // WARNING - Borrows results from the General frame above
+  outframe.data.bytes[1] = y / 3;
+  outframe.data.bytes[2] = lowByte (z);
+  outframe.data.bytes[3] = highByte (z);
+  outframe.data.bytes[4] = lowByte (uint16_t (totdccur)); //0.005Amp
+  outframe.data.bytes[5] = highByte (uint16_t (totdccur));  //0.005Amp
+  outframe.data.bytes[6] = lowByte (uint16_t (modulelimcur * 0.66666));
+  outframe.data.bytes[7] = highByte (uint16_t (modulelimcur * 0.66666));
+  Can1.sendFrame(outframe);
+
+  //// Only report on the VSLOW basis ~once/30s////
+  if (VSlowRollover)
+  {
+    ///// TEMP REPORTING //////
+    // Picked up by the Thermal Module (reported temps and target inlet temps)
+    
+    //// Charger Temp Info Output - TesLorean ////
+    outframe.id = TesLoreanChargerID;
+    outframe.length = 8;            // Data payload 8 bytes
+    outframe.extended = 0;          // Extended addresses - 0=11-bit 1=29bit
+    outframe.rtr = 0;                 //No request
+
+    // Populate with Module temps (2 per module)
+    outframe.data.bytes[0] = templeg[0][0];   // Phase 1 temps
+    outframe.data.bytes[1] = templeg[1][0];
+    outframe.data.bytes[2] = templeg[1][1];   // Phase 2 temps
+    outframe.data.bytes[3] = templeg[1][1];
+    outframe.data.bytes[4] = templeg[1][2];   // Phase 3 temps
+    outframe.data.bytes[5] = templeg[1][2];
+    outframe.data.bytes[6] = 0x00;
+    outframe.data.bytes[7] = 0x00;
+    Can1.sendFrame(outframe);
+
+    // Populate with Module inlet temp targets (1 per module)
+    outframe.id = (TesLoreanChargerID + 1);
+    outframe.data.bytes[0] = inlettarg[0];   // Phase 1 inlet target temp
+    outframe.data.bytes[1] = inlettarg[1];   // Phase 2 inlet target temp
+    outframe.data.bytes[2] = inlettarg[2];   // Phase 3 inlet target temp
+    outframe.data.bytes[3] = 0x00;
+    outframe.data.bytes[4] = 0x00;
+    outframe.data.bytes[5] = 0x00;
+    outframe.data.bytes[6] = 0x00;
+    outframe.data.bytes[7] = 0x00;
+    Can1.sendFrame(outframe);
+  }
+
+  //// Only report on the Fast basis ~once/second ////
+  if (FastRollover)
+  {
+    //// CHARGING INFO ////
+    
+    //// Charging Status Info - TesLorean ////
+    outframe.id = TesLoreanChargerID;
+    outframe.length = 8;            // Data payload 8 bytes
+    outframe.extended = 0;          // Extended addresses - 0=11-bit 1=29bit
+    outframe.rtr = 0;                 //No request
+
+    //// CHARGING INFO ////
+    if (state != 0)   // Only report if Charger is active
+    {
+      // Picked up by the instrument cluster controller and trip computer
+      outframe.id = (TesLoreanChargerID + 4);
+      outframe.data.bytes[0] = 0x01;  // Hours
+      outframe.data.bytes[1] = 0x01;  // Mins
+      outframe.data.bytes[2] = 0x01;  // Seconds
+      outframe.data.bytes[3] = 0x00;
+      outframe.data.bytes[4] = 0x00;
+      outframe.data.bytes[5] = 0x00;
+      outframe.data.bytes[6] = 0x00;
+      outframe.data.bytes[7] = 0x00;
+      Can1.sendFrame(outframe);
+    }
+  }
+
+  /*////////Elcon Message////////////
+  // Disabled as redundant for TesLorean
   // ?PURPOSE? This is sent JUST IN CASE there is an Elcon controller
   outframe.id = ElconID;
   outframe.length = 8;            // Data payload 8 bytes
@@ -1290,26 +1489,35 @@ void Charger_msgs()
   outframe.data.bytes[6] = 0x00;
   outframe.data.bytes[7] = 0x00;
   Can1.sendFrame(outframe);
+  */
 
-  ///DCDC CAN//////////////////////////////////////////////////////////////////////
+  ///DCDC CAN CONTROL ///////////////////
+
   // Check if setting indicate that Charger should set the DCDC voltage (Tesla DCDC Converter only)
-  if (dcdcenable)
+  // JEC - Only need to send out to DCDC every second
+  if (dcdcenable && FastRollover)
   {
-    outframe.id = 0x3D8;
+    outframe.id = DCDCConverterControlID;  // Tesla specific DCDC Converter code
     outframe.length = 3;            // Data payload 8 bytes
     outframe.extended = 0;          // Extended addresses - 0=11-bit 1=29bit
     outframe.rtr = 0;                 //No request
 
     // Populate with the target DC voltage for the DCDC converter
-    outframe.data.bytes[0] = highByte (uint16_t((parameters.dcdcsetpoint - 9000) / 68.359375) << 6);
-    outframe.data.bytes[1] = lowByte (uint16_t((parameters.dcdcsetpoint - 9000) / 68.359375) << 6);
+    // JEC - Calculate the voltage required once
+    // Leave calculation here just in case the Charger will sometimes run in different DC voltage levels
+    // Enabling the DCDC to output voltage, makes sure that the charger 12v systems are not running from battery
+    uint16_t DCDCVoltageTarget = (uint16_t((parameters.dcdcsetpoint - 9000) / 68.359375) << 6);
+    outframe.data.bytes[0] = highByte (DCDCVoltageTarget);
+    outframe.data.bytes[1] = lowByte (DCDCVoltageTarget);
+//    outframe.data.bytes[0] = highByte (uint16_t((parameters.dcdcsetpoint - 9000) / 68.359375) << 6);
+//    outframe.data.bytes[1] = lowByte (uint16_t((parameters.dcdcsetpoint - 9000) / 68.359375) << 6);
 
     outframe.data.bytes[1] = outframe.data.bytes[1] | 0x20;
     outframe.data.bytes[2] = 0x00;
     Can1.sendFrame(outframe);
   }
 
-  ////////////////////////////////////////////////////////////////////
+  /////////SLAVE CHARGER INSTRUCTIONS ///////////////
 
   // Check if in Master mode
   if (parameters.canControl == 1)
@@ -1408,7 +1616,7 @@ void Pilotread()
   Pilotcalc();
 }
 
-// ?CHECK? - if it works correctly it is a very clever routine
+// This function is called by an interrupt that is monitoring the value of the PILOT line
 // Calculates the AC Current Limit from the duty cyle of the PILOT line
 // keeps updating 'duration since last high read', the when it goes low then calculates duty cyle
 void Pilotcalc()
