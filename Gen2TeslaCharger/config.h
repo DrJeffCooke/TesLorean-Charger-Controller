@@ -1,6 +1,7 @@
 #ifndef __CONFIG_H__
 #define __CONFIG_H__
 
+// PIN Mapping for Microcontroller
 #define CHARGER1_ENABLE     3
 #define CHARGER2_ENABLE     4
 #define CHARGER3_ENABLE     5
@@ -17,8 +18,11 @@
 #define EVSE_PILOT          2
 #define EVSE_PROX           A0
 
+// Change this value if you want to load a new set of parameters into EEPROM
+// If left the same, the parameter values from EEPROM are used
 #define EEPROM_VERSION      10
 
+// Data structure to hold the EEPROM values
 typedef struct
 {
     uint8_t  version; //eeprom version stored
