@@ -31,9 +31,9 @@ int candebug = 1;   // show CAN updates and timeouts
 uint16_t curset = 0;  // ?BUG? - variable not found in the code
 int  setting = 1;     // Flag to indicate if a entry made to change a setting (setting changed = 1, not changed = 0)
 int incomingByte = 0; // Temporary variable for last byte received via serial port
-int state;            // Charger state (0 = turn chargers off, 1 = turn chargers on, 2 = enable chargers, 3 = waiting for chargers to enable)
+int state;            // Current charger state (0 = turn chargers off, 1 = turn chargers on, 2 = enable chargers, 3 = waiting for chargers to enable)
+int reqdstate;        // Request to change to this state
 bool bChargerEnabled; // Flag to indicate if chargers are enabled or not (state = 1)(false = not enabled, true = enabled)
-bool bChargerEnabling;// Flag to indicate that chargers are in the process of enabling (state=2 or state=3)
 // tcan => time at last incoming CAN message for Elcon or slave charging
 // tboot => time at instruction to startup the modules
 // tlast => time at last status message
@@ -146,7 +146,7 @@ void setup()
     parameters.currReq = 0;               // max current input limit per module, note: 1500 = 1A
     parameters.enabledChargers = 123;     // enable per phase - 123 is all phases - 3 is just phase 3
     parameters.mainsRelay = 48;           // ?BUG? variable is not referenced in the code. It may refer to the line on the microcontroller that outputs to the main s relay
-    parameters.autoEnableCharger = 0;     // 1 = enabled, 0 = disabled auto start, with proximity and pilot control
+    parameters.autoEnableCharger = 1;     // 1 = enabled, 0 = disabled auto start, with proximity and pilot control
     parameters.canControl = 0;            // 0 = disabled can control, or in the following modes 1 = master, 2 = Elcon master, 3 = slave
                                           // Master mode also accommodates a Slave charger (i.e. sends Slave CAN instructions every 100ms)
     parameters.dcdcsetpoint = 14000;      // voltage setpoint for DCDC Converter in mv (sent via external CAN to DCDC)
@@ -259,9 +259,12 @@ void loop()
           if (parameters.autoEnableCharger > 1)
           {
             parameters.autoEnableCharger = 0;
-            Serial.println("Error : Autostart selections are 'a' followed by 0 or 1. Autostart disabled.");
+            Serial.println("Error : Autostart selections are 'a' followed by 0 or 1.");
           }
           setting = 1;
+          // Confirmation message
+          if (parameters.autoEnableCharger == 0){Serial.println("Info : Autostart disabled.");}
+          else {Serial.println("Info : Autostart enabled.");}
         }
         break;
 
@@ -286,6 +289,12 @@ void loop()
           {
             Serial.println("Error : Phase entry must be p1 or p3");
           }
+          else
+          {
+            // Confirmation message
+            if ( parameters.phaseconfig == 3){Serial.println("Info : Phase set to 'Three Phase'");}
+            else {Serial.println("Info : Phase set to 'Single Phase'");}
+          }
         }
         break;
 
@@ -307,6 +316,12 @@ void loop()
           {
             Serial.println("Error : Type entry must be t1 or t2");
           }
+          else
+          {
+            // Confirmation message
+            if (parameters.type == 2 ){Serial.println("Info : Set as Type 2.");}
+            else {Serial.println("Error : Set as Type 1.");}
+          }
         }
         break;
 
@@ -316,10 +331,15 @@ void loop()
           parameters.canControl = Serial.parseInt();    // returns 0 if no int found
           if (parameters.canControl > 3)
           {
-            Serial.println("Error : CAN control selections are 'x' followed by 0,1,2, or 3. CAN control disabled.");
+            Serial.println("Error : CAN control selections are 'x' followed by 0,1,2, or 3.");
             parameters.canControl = 0;
           }
           setting = 1;
+          // Confirmation message
+          if (parameters.canControl == 0){Serial.println("Info : CAN control disabled.");}
+          if (parameters.canControl == 1){Serial.println("Info : CAN control in Master mode.");}
+          if (parameters.canControl == 2){Serial.println("Info : CAN control in Elcon Master mode.");}
+          if (parameters.canControl == 3){Serial.println("Info : CAN control in Slave mode.");}
         }
         break;
 
@@ -337,6 +357,8 @@ void loop()
               // ?WHY? - Doesn't set a EEPROM value, just sets the maximum that the current run uses (initialed as 45000)
               maxdccur = (tempdccur * 1000);
               setting = 1;
+              // Confirmation message
+              Serial.println("Info : New setting for Maximum DC Current.");
             }
             else
             {
@@ -362,7 +384,8 @@ void loop()
             if (tempmaxvolt <= maxhivolts)
             {
               parameters.voltSet = (tempvolt * 100);
-              setting = 1;          
+              setting = 1;
+              Serial.println("Info : New setting for Voltage.");
             }
             else
             {
@@ -385,24 +408,25 @@ void loop()
           // digitalWrite(LED_BUILTIN, HIGH);
 
           // If still in the initializing process (state==2) then don't do anything
-          if (state == 2)
+          if (state == 2 || state == 3)
           {
             Serial.println("Error : Modules are still initializing, please wait a moment and try again.");
           }
           // If currently stopped - signal the start process (two stage)
           if (state == 0)
           {
-            state = 2;          // Start the process of enabling and activating the modules
-            tboot = millis();   // Set the time at which the 'start' 'stop' command was issued
+            reqdstate = 2;          // Start the process of enabling and activating the modules
+            tboot = millis();   // Set the time at which the 'start' 'stop' command was issued // Now redundant, but harmless
             setting = 1;
+            Serial.println("Info : Initiating Module startup.");
           }
           // if currently started - signal to stop
           if (state == 1)
           {
-            state = 0;          // shutdown modules
+            reqdstate = 0;          // shutdown modules
             setting = 1;
+            Serial.println("Info : Initiating Module shutdown.");
           }
-
         //}
         break;
 
@@ -416,6 +440,8 @@ void loop()
           {
             parameters.enabledChargers = tempCs;
             setting = 1;
+            // Confirmation message
+            Serial.println("Info : Instruction accepted for enabled chargers.");
           }
           else
           {
@@ -438,6 +464,8 @@ void loop()
             {
               parameters.currReq = tempmaxcur;
               setting = 1;
+              // Confirmation message
+              Serial.println("Info : New setting for Current.");
             }
             else
             {
@@ -463,15 +491,11 @@ void loop()
     // Two blank lines
     Serial.println();
     Serial.println("NEW PARAMETERS...");
-
-    if (state == 1)
-    {
-      Serial.print("Charger = On ");
-    }
-    else
-    {
-      Serial.print("Charger = Off");
-    }
+    Serial.print("Charger = ");
+    if (state == 0){Serial.print("Off");}
+    if (state == 1){Serial.print("On");}
+    if (state == 2){Serial.print("Enabling");}
+    if (state == 3){Serial.print("Activating");}
     Serial.print(" | Enabled Modules = ");
     Serial.print(parameters.enabledChargers);
     Serial.print(" | Phases = ");
@@ -538,7 +562,7 @@ void loop()
       if (millis() - tcan > 500)
       {
         // Shutdown the charger
-        state = 0;
+        reqdstate = 0;
         Serial.println();
         Serial.println("WARNING : CAN (incoming) time-out for slave.");
       }
@@ -551,7 +575,7 @@ void loop()
   if (digitalRead(DIG_IN_1) == LOW && state != 1)   
   {
     // Don't allow chargers to enable OR instruct the chargers to disable
-    state = 0;
+    reqdstate = 0;
   }
 
   // Check the state of the chargers vs their enabled status and take action
@@ -560,41 +584,43 @@ void loop()
   // state 2 : Enable the chargers
   // state 3 : Waiting 500ms after being enabled
   // Sequence 0 -> 2 -> 3 -> 1 (enabled & activated) -> 0 (shutdown)
-  // bChargerEnabled : chargers are enabled and active
-  // bChargerEnabling : chargers are enabled but not activated
-  switch (state)
+  // bChargerEnabled : chargers are enabled (may not be active)
+  switch (reqdstate)
   {
-    // Charger should be in an OFF state or changed to an OFF state
+    // REquest that to move Charger to an OFF state
     case 0: 
 
       // ?PRIOR? - Send the deactivate, disable commands on every loop.  May be required behavior.
 
       // Check that the chargers are currently enabled
-      if (bChargerEnabled == true || bChargerEnabling == true)
+      if (state != 0)  // If already shutdown, ignore request
       {
-        // Note: In prior versions the deactivate and diasble codes were sent on every loop
-        digitalWrite(DIG_OUT_1, LOW);//MAINS OFF
-        digitalWrite(EVSE_ACTIVATE, LOW);
-        digitalWrite(CHARGER1_ACTIVATE, LOW); //chargeph1 deactivate
-        digitalWrite(CHARGER2_ACTIVATE, LOW); //chargeph2 deactivate
-        digitalWrite(CHARGER3_ACTIVATE, LOW); //chargeph3 deactivate
-        digitalWrite(CHARGER1_ENABLE, LOW);//disable phase 1 power module
-        digitalWrite(CHARGER2_ENABLE, LOW);//disable phase 2 power module
-        digitalWrite(CHARGER3_ENABLE, LOW);//disable phase 3 power module
-  
-        // Flag that the chargers are now OFF
-        bChargerEnabling = false;
-        bChargerEnabled = false;
+        // For emergency shutdown reasons - If shutdown is requested just action immediately
       }
+      digitalWrite(DIG_OUT_1, LOW);//MAINS OFF
+      digitalWrite(EVSE_ACTIVATE, LOW);   // Tell the EVSE to stop providing power
+      digitalWrite(CHARGER1_ACTIVATE, LOW); //chargeph1 deactivate
+      digitalWrite(CHARGER2_ACTIVATE, LOW); //chargeph2 deactivate
+      digitalWrite(CHARGER3_ACTIVATE, LOW); //chargeph3 deactivate
+      digitalWrite(CHARGER1_ENABLE, LOW);//disable phase 1 power module
+      digitalWrite(CHARGER2_ENABLE, LOW);//disable phase 2 power module
+      digitalWrite(CHARGER3_ENABLE, LOW);//disable phase 3 power module
+          
+      // Flag that the chargers are now OFF
+      state = 0;
+      bChargerEnabled = false;
+
+      // Turn the LED indicator light 
+      digitalWrite(LED_BUILTIN, LOW);
       break;
 
-    // Charger should be in an ON state or changed to an ON state
+    // Request to change Charger to an ON state
     case 1:
 
-      // Check that the Chargers are currently listed as OFF
-      if (bChargerEnabled == false && bChargerEnabling == true)
+      // Check that the Chargers are currently listed as having Enabled
+      if (state == 3 && bChargerEnabled == true)
       {      
-        // Enable the correct chargers
+        // Activate the correct chargers
         switch (parameters.enabledChargers)
         {
           // Test the most likely case first, all others are unlikely options
@@ -637,74 +663,84 @@ void loop()
             break;
         }
         
-        // Flag that the chargers are enabled
-        bChargerEnabling = false;
-        bChargerEnabled = true;
+        // Flag that the chargers are active
+        state = 1;
 
         // Delay 100ms, then signal to switch the mains on (via relay) and activate the EVSE
         delay(100);
         digitalWrite(DIG_OUT_1, HIGH);        // MAINS ON (via relay)
         digitalWrite(EVSE_ACTIVATE, HIGH);    // Signal to EVSE to provide power
+
+        // Turn the LED indicator light 
+        digitalWrite(LED_BUILTIN, HIGH);
       }
       break;
 
     case 2:
 
-      // ?PRIOR? - Code would send an ENABLE on every loop while in status=2 (which lasts 500ms)
-      // Possible that this was a necessary practice (since CAN messages are not guarenteed delivery)
-
       // Start the enable process for the selected chargers
-      switch (parameters.enabledChargers)
+      if (state == 0)
       {
-        // Check the most likely case first
-        case 123:
-          digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
-          digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
-          digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
-          break;
-        case 1:
-          digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
-          break;
-        case 2:
-          digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
-          break;
-        case 3:
-          digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
-          break;
-        case 12:
-          digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
-          digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
-          break;
-        case 13:
-          digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
-          digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
-          break;
-
-        case 23:
-          digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
-          digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
-          break;
-
-        default:
-          // if nothing else matches, do the default
-          break;
+        switch (parameters.enabledChargers)
+        {
+          // Check the most likely case first
+          case 123:
+            digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
+            digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
+            digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
+            break;
+          case 1:
+            digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
+            break;
+          case 2:
+            digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
+            break;
+          case 3:
+            digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
+            break;
+          case 12:
+            digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
+            digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
+            break;
+          case 13:
+            digitalWrite(CHARGER1_ENABLE, HIGH);//enable phase 1 power module
+            digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
+            break;
+  
+          case 23:
+            digitalWrite(CHARGER2_ENABLE, HIGH);//enable phase 2 power module
+            digitalWrite(CHARGER3_ENABLE, HIGH);//enable phase 3 power module
+            break;
+  
+          default:
+            // if nothing else matches, do the default
+            break;
+        }
+        // Update the state
+        state = 2;
+        
+        // Keep the chargers as NOT ENABLED until after the 500ms has expired (to give them time to enable)
+        // Once enabled they will get CAN frames
+        bChargerEnabled = false;
+        
+        // Request to go to state=3, which will last for 500ms
+        reqdstate = 3;
+  
+        // DEBUG Should 'tboot' be set here? instead of in multiple other locations?
+        tboot = millis();   // Set the time at which the chargers were instructed to enable
       }
-      // Flag that the chargers are in the enabling sequence
-      bChargerEnabling = true;
-      
-      // Set state=3, which will last for 500ms
-      state = 3;
-
-      // DEBUG Should 'tboot' be set here? instead of in multiple other locations?
-      
       break;    // Missing in prior code, but no ill-effects
 
     case 3:
-      // Check that 500ms has passed since status=2 (signal to start enabling) was set
-      if (tboot <  (millis() - 500))
+      // Check that 500ms has passed since state = 2 (signal to start enabling) was set
+      if (state == 2)
       {
-        // After 500ms okay to start the ACTIVATE module process
-        state = 1;
+        if (tboot <  (millis() - 500))
+        {
+          // After 500ms okay to start the ACTIVATE module process
+          reqdstate = 1;
+          bChargerEnabled = true;
+        }
       }
       break;
 
@@ -802,14 +838,9 @@ void loop()
       }
       else
       {
-        if (state == 0)
-        {
-          Serial.print("[CHARGER] Modules Turned OFF");
-        }
-        if (state == 2 || state == 3)
-        {
-          Serial.print("[CHARGER] Modules Enabling...");
-        }
+        if (state == 0){Serial.print("[CHARGER] Modules Turned OFF");}
+        if (state == 2){Serial.print("[CHARGER] Modules Enabling...");}
+        if (state == 3){Serial.print("[CHARGER] Modules Activating...");}
         Serial.println();
       }
       if (debugevse != 0)
@@ -858,7 +889,7 @@ void loop()
           if (digitalRead(DIG_IN_1) == HIGH)
           {
             // Start the process of initializing the modules
-            state = 2;
+            reqdstate = 2;
 
             // Set a timer recording the start of the initialize request
             // ??Should this be done in the code that handles the state = 2 request?
@@ -871,7 +902,7 @@ void loop()
     }
     else // unplugged or buton pressed stop charging
     {
-      state = 0;
+      reqdstate = 0;
       digitalWrite(DIG_OUT_2, LOW); //disable AC present indication
 
       // ?? Isn't this taken care of in the 'state=0' code ??
@@ -1087,7 +1118,7 @@ void canextdecode(CAN_FRAME & frame)
         if (state != 0)
         {
           // Switch the Charger off // Disable Auto Charging
-          state = 0;                              // shutdown modules
+          reqdstate = 0;                              // shutdown modules
           parameters.autoEnableCharger = 0;       // Disable Auto Charging
           setting = 1;
         }
@@ -1097,7 +1128,7 @@ void canextdecode(CAN_FRAME & frame)
         if (state == 0)
         {
           // Switch the Charger on // Disable Auto Charging
-          state = 2;          // Start the process of enabling and activating the modules
+          reqdstate = 2;          // Start the process of enabling and activating the modules
           tboot = millis();   // Set the time at which the 'start' 'stop' command was issued
           parameters.autoEnableCharger = 0;       // Disable Auto Charging
           setting = 1;
@@ -1109,7 +1140,7 @@ void canextdecode(CAN_FRAME & frame)
         if (state != 0)
         {
           // Switch the Charger off // Disable Auto Charging
-          state = 0;                              // shutdown modules
+          reqdstate = 0;                              // shutdown modules
         }
         parameters.autoEnableCharger = 0;       // Disable Auto Charging
         setting = 1;
@@ -1137,7 +1168,7 @@ void canextdecode(CAN_FRAME & frame)
         if (state == 0)
         {
           // Start the chargers enabling process
-          state = 2;
+          reqdstate = 2;
           // Start the clock (marks entry to state=2)
           tboot = millis();
         }
@@ -1145,7 +1176,7 @@ void canextdecode(CAN_FRAME & frame)
       else  // Databyte flag was not set
       {
         // Shut the chargers down
-        state = 0;
+        reqdstate = 0;
       }
 
       // Info if debugging
@@ -1179,7 +1210,7 @@ void canextdecode(CAN_FRAME & frame)
         if (state == 0)
         {
           // Start the charger enabling process
-          state = 2;
+          reqdstate = 2;
           // Mark the time of entry to state=2
           tboot = millis();
         }
@@ -1195,7 +1226,7 @@ void canextdecode(CAN_FRAME & frame)
         }
         if(millis()-slavetimeout > 500)
         {
-        state = 0;
+          reqdstate = 0;
         }
       }
 
