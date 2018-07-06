@@ -20,7 +20,7 @@
 
 // Change this value if you want to load a new set of parameters into EEPROM
 // If left the same, the parameter values from EEPROM are used
-#define EEPROM_VERSION      13
+#define EEPROM_VERSION      14
 
 // Data structure to hold the EEPROM values
 typedef struct

@@ -878,6 +878,8 @@ void loop()
             // Set a timer recording the start of the initialize request
             // ??Should this be done in the code that handles the state = 2 request?
             tboot = millis();
+
+            if (debugevse != 0){Serial.println("[EVSE] Requesting start-up (state=2)");}
           }
         //}
         }
@@ -891,6 +893,9 @@ void loop()
 
       // ?? Isn't this taken care of in the 'state=0' code ??
       digitalWrite(EVSE_ACTIVATE, LOW);
+
+      if (debugevse != 0){Serial.println("[EVSE] Requesting shutdown (state=0)");}
+
     }
   }
 }
@@ -1105,6 +1110,9 @@ void canextdecode(CAN_FRAME & frame)
           reqdstate = 0;                              // shutdown modules
           parameters.autoEnableCharger = 0;       // Disable Auto Charging
           setting = 1;
+
+          // Info if debugging
+          if (candebug == 1){Serial.println("[CANext] Requesting shutdown (state=0)");}
         }
       }
       if (frame.data.bytes[0]==1)     // ON
@@ -1116,6 +1124,9 @@ void canextdecode(CAN_FRAME & frame)
           tboot = millis();   // Set the time at which the 'start' 'stop' command was issued
           parameters.autoEnableCharger = 0;       // Disable Auto Charging
           setting = 1;
+
+          // Info if debugging
+          if (candebug == 1){Serial.println("[CANext] Requesting start-up (state=0)");}
         }
       }
       if (frame.data.bytes[0]==2)     // AUTO, shutdown any charging
@@ -1127,6 +1138,10 @@ void canextdecode(CAN_FRAME & frame)
           reqdstate = 0;                              // shutdown modules
         }
         parameters.autoEnableCharger = 0;       // Disable Auto Charging
+
+        // Info if debugging
+        if (candebug == 1){Serial.println("[CANext] Requesting return AutoEnabledCharging mode");}
+
         setting = 1;
       }
       // Note: Considered DC AC VOlts/Current settings via CAN, but very unlikely to be used, and can be done via USB
