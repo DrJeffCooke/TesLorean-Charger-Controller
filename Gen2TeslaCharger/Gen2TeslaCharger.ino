@@ -71,7 +71,7 @@ int activemodules, slavechargerenable = 0;
 // For validation checks
 uint16_t maxhiaccur = maxaccur;            // maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
 uint16_t maxhidccur = maxdccur;            // maximum limit DC current output in mA
-uint16_t maxhivolts = 40000;               // set to 400v; maximum limit Voltage in 0.01V (hundreds of a volt)
+uint16_t maxhivolts = 40000;               // set to 400v; maximum limit Voltage in 0.01V (hundredths of a volt)
 
 //*********Feedback from charge VARIABLE   DATA ******************
 uint16_t dcvolt[3] = {0, 0, 0};       //DC Voltage, 1 = 1V
@@ -143,18 +143,20 @@ void setup()
     parameters.version = EEPROM_VERSION;  // Increment the EEPROM_VERSION constant in the Config.H file to force a reloading of the EEPROM stored values
     parameters.can0Speed = 500000;        // CAN0 connects to the internal charger modules
     parameters.can1Speed = 500000;        // CAN1 is exposed externally at the port
-    parameters.currReq = 0;               // max current input limit per module, note: 1500 = 1A
     parameters.enabledChargers = 123;     // enable per phase - 123 is all phases - 3 is just phase 3
     parameters.mainsRelay = 48;           // ?BUG? variable is not referenced in the code. It may refer to the line on the microcontroller that outputs to the main s relay
-    parameters.autoEnableCharger = 1;     // 1 = enabled, 0 = disabled auto start, with proximity and pilot control
-    parameters.canControl = 0;            // 0 = disabled can control, or in the following modes 1 = master, 2 = Elcon master, 3 = slave
-                                          // Master mode also accommodates a Slave charger (i.e. sends Slave CAN instructions every 100ms)
-    parameters.dcdcsetpoint = 14000;      // voltage setpoint for DCDC Converter in mv (sent via external CAN to DCDC)
     
-    // TesLorean COnfiguration
+    // TesLorean Configuration
+    parameters.currReq = 4500;            // max current input limit per module, note: 1500 = 1A, 4500 = 3A
     parameters.voltSet = maxhivolts;      // 1 = 0.01V
     parameters.phaseconfig = Singlephase; //AC input configuration (US=Singlephase, EU=Threephase)
     parameters.type = 1;                  // Socket type1 or 2. Note Type 1 is J1772 USA
+    parameters.autoEnableCharger = 1;     // 1 = enabled, 0 = disabled auto start, with proximity and pilot control
+    parameters.canControl = 1;            // 0 = disabled can control, or in the following modes 1 = master, 2 = Elcon master, 3 = slave
+                                          // Master mode also accommodates a Slave charger (i.e. sends Slave CAN instructions every 100ms)
+    parameters.dcdcsetpoint = 14000;      // voltage setpoint for DCDC Converter in mv (sent via external CAN to DCDC)
+
+    // Write out the replacement values
     EEPROM.write(0, parameters);          // Write the values out to the EEPROM
   }
 
@@ -164,7 +166,6 @@ void setup()
     Serial.println("Using CAN1 - initialization completed.\n");
   }
   else Serial.println("CAN1 initialization (sync) ERROR\n");
-
 
   // Initialize CAN0
   if (Can0.begin(parameters.can0Speed, 255)) //can0 charger modules
@@ -209,7 +210,7 @@ void setup()
   pinMode(EVSE_ACTIVATE, OUTPUT); //pull Pilot to 6V
   ///////////////////////////////////////////////////////////////////////////////////////
 
-  // Set the maximum AC current (note maxaccur
+  // Set the maximum AC current
   dcaclim = maxaccur;
 
   bChargerEnabled = false; //  ?FIXED? are we supposed to command the charger to charge?
@@ -507,45 +508,19 @@ void loop()
     Serial.print("A | DC = ");
     Serial.print(maxdccur * 0.001, 1);
     Serial.print("A | ");
-    if (parameters.autoEnableCharger == 1)
-    {
-      Serial.print("Autostart On ");
-    }
-    else
-    {
-      Serial.print("Autostart Off");
-    }
+    if (parameters.autoEnableCharger == 1){Serial.print("Autostart On ");}
+    else{Serial.print("Autostart Off");}
     Serial.print(" | ");
-    if (parameters.canControl == 1)
-    {
-      Serial.print("Can Mode = Master       ");
-    }
-    if (parameters.canControl == 2)
-    {
-      Serial.print("Can Mode = Master Elcon ");
-    }
-    if (parameters.canControl == 3)
-    {
-      Serial.print("Can Mode = Slave        ");
-    }
+    if (parameters.canControl == 1){Serial.print("Can Mode = Off          ");}
+    if (parameters.canControl == 1){Serial.print("Can Mode = Master       ");}
+    if (parameters.canControl == 2){Serial.print("Can Mode = Master Elcon ");}
+    if (parameters.canControl == 3){Serial.print("Can Mode = Slave        ");}
     Serial.print(" | ");
-    if (parameters.phaseconfig == Singlephase)
-    {
-      Serial.print("Single Phase");
-    }
-    if (parameters.phaseconfig == Threephase)
-    {
-      Serial.print("Three Phase ");
-    }
+    if (parameters.phaseconfig == Singlephase){Serial.print("Single Phase");}
+    if (parameters.phaseconfig == Threephase){Serial.print("Three Phase ");}
     Serial.print(" | ");
-    if (parameters.type == 1)
-    {
-      Serial.print("Type 1");
-    }
-    if (parameters.type == 2)
-    {
-      Serial.print("Type 2");
-    }
+    if (parameters.type == 1){Serial.print("Type 1");}
+    if (parameters.type == 2){Serial.print("Type 2");}
     setting = 0;
     Serial.println();
     Serial.println();
@@ -765,22 +740,10 @@ void loop()
       Serial.print(state);
       Serial.print(" | Phases = ");
       Serial.print(parameters.phaseconfig);
-      if (bChargerEnabled)
-      {
-        Serial.print(" | Chargers ON");
-      }
-      else
-      {
-        Serial.print(" | Chargers OFF");
-      }
-      if (digitalRead(DIG_IN_1) == HIGH)
-      {
-        Serial.print(" | EnableLine Hi");
-      }
-      else
-      {
-        Serial.print(" | EnableLine Lo");
-      }
+      if (bChargerEnabled) {Serial.print(" | Chargers ON");}
+      else {Serial.print(" | Chargers OFF");}
+      if (digitalRead(DIG_IN_1) == HIGH) {Serial.print(" | EnableLine Hi");}
+      else {Serial.print(" | EnableLine Lo");}
       /*
         Serial.print(" AC limit : ");
         Serial.print(accurlim);
@@ -845,7 +808,7 @@ void loop()
       }
       if (debugevse != 0)
       {
-        Serial.println();
+        //Serial.println();
         Serial.print("[EVSE] Proximity Status = ");
         switch (Proximity)
         {
