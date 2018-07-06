@@ -401,34 +401,21 @@ void loop()
         break;
 
       case 's':   //s for start AND stop
-        // ?BUG? - there does not need to be additional bytes available on the serial port before toggling start/stop
-        //if (Serial.available() > 0)
-        //{
-
-          // ?BUG? Why set the LED high here?  Wait until the state setting is processed and switch on/off there
-          // digitalWrite(LED_BUILTIN, HIGH);
-
-          // If still in the initializing process (state==2) then don't do anything
-          if (state == 2 || state == 3)
-          {
-            Serial.println("Error : Modules are still initializing, please wait a moment and try again.");
-          }
-          // If currently stopped - signal the start process (two stage)
-          if (state == 0)
-          {
-            reqdstate = 2;          // Start the process of enabling and activating the modules
-            tboot = millis();   // Set the time at which the 'start' 'stop' command was issued // Now redundant, but harmless
-            setting = 1;
-            Serial.println("Info : Initiating Module startup.");
-          }
-          // if currently started - signal to stop
-          if (state == 1)
-          {
-            reqdstate = 0;          // shutdown modules
-            setting = 1;
-            Serial.println("Info : Initiating Module shutdown.");
-          }
-        //}
+        // If currently stopped - signal the start process (two stage)
+        if (state == 0)
+        {
+          reqdstate = 2;          // Start the process of enabling and activating the modules
+          tboot = millis();   // Set the time at which the 'start' 'stop' command was issued // Now redundant, but harmless
+          setting = 1;
+          Serial.println("Info : Initiating Module startup.");
+        }
+        // if currently started (states 1,2,3) - signal to stop
+        if (state > 1)
+        {
+          reqdstate = 0;          // shutdown modules
+          setting = 1;
+          Serial.println("Info : Initiating Module shutdown.");
+        }
         break;
 
       case 'e':   //e for enabling chargers followed by 1 to 3 digits (comprised of 1,2,3) to indicate which ones to run
@@ -489,6 +476,9 @@ void loop()
     // A parameter has changed so update the EEPROM store with the new values
     EEPROM.write(0, parameters);
 
+    // clear the setting flag
+    setting == 0;
+
     // Two blank lines
     Serial.println();
     Serial.println("NEW PARAMETERS...");
@@ -499,8 +489,8 @@ void loop()
     if (state == 3){Serial.print("Activating");}
     Serial.print(" | Enabled Modules = ");
     Serial.print(parameters.enabledChargers);
-    Serial.print(" | Phases = ");
-    Serial.print(parameters.phaseconfig);
+    //Serial.print(" | Phases = ");
+    //Serial.print(parameters.phaseconfig);
     Serial.print(" | Set voltage = ");
     Serial.print(parameters.voltSet * 0.01f, 0);
     Serial.print("V | Set current lim AC = ");
@@ -511,7 +501,7 @@ void loop()
     if (parameters.autoEnableCharger == 1){Serial.print("Autostart On ");}
     else{Serial.print("Autostart Off");}
     Serial.print(" | ");
-    if (parameters.canControl == 1){Serial.print("Can Mode = Off          ");}
+    if (parameters.canControl == 0){Serial.print("Can Mode = Off          ");}
     if (parameters.canControl == 1){Serial.print("Can Mode = Master       ");}
     if (parameters.canControl == 2){Serial.print("Can Mode = Master Elcon ");}
     if (parameters.canControl == 3){Serial.print("Can Mode = Slave        ");}
@@ -526,7 +516,7 @@ void loop()
     Serial.println();
   }
 
-  // When under CanControl, and ElCon/Slave, check that a minimum amount of time (500ms) hasn't passed since 'tcan' was set?
+  // When under CanControl and for ElCon/Slave modes, check that a minimum amount of time (500ms) hasn't passed since 'tcan' was set?
   // If more than 500ms, set the flag to shutdown charging - the CAN has timed out
   if (parameters.canControl > 1)
   {
@@ -546,32 +536,32 @@ void loop()
 
   // Test that the Enable line is 12v (CHARGER Switch is ON)
   // ?PENDING? - if scheduled charging, the enable line need not be high
-  // if Enable line OFF, but request to enable chargers, chargers are enabled, or enabling - set status to shutdown chargers
-  if (digitalRead(DIG_IN_1) == LOW && state != 1)   
+  // if Enable line OFF - set status to immediately shutdown chargers
+  if (digitalRead(DIG_IN_1) == LOW)   
   {
-    // Don't allow chargers to enable OR instruct the chargers to disable
+    // Don't allow chargers to enable, always instruct the chargers to disable
     reqdstate = 0;
   }
 
   // Check the state of the chargers vs their enabled status and take action
-  // state 0 : Chargers are not enabled, or if enabled shut them down
-  // state 1 : Chargers are activated, or if not active will be activated
-  // state 2 : Enable the chargers
-  // state 3 : Waiting 500ms after being enabled
-  // Sequence 0 -> 2 -> 3 -> 1 (enabled & activated) -> 0 (shutdown)
+  // state 0 : Chargers are shutdown
+  // state 1 : Chargers are enabled and activated
+  // state 2 : Chargers are enabling
+  // state 3 : Chargers waiting 500ms after being enabled
+  // Sequence 0 off -> 2 enabling -> 3 enabled -> 1 activated -> 0 shutdown
   // bChargerEnabled : chargers are enabled (may not be active)
   switch (reqdstate)
   {
-    // REquest that to move Charger to an OFF state
+    // Request to move Charger to an OFF state
     case 0: 
 
       // ?PRIOR? - Send the deactivate, disable commands on every loop.  May be required behavior.
 
       // Check that the chargers are currently enabled
-      if (state != 0)  // If already shutdown, ignore request
-      {
+      //if (state != 0)  // If already shutdown, ignore request
+      //{
         // For emergency shutdown reasons - If shutdown is requested just action immediately
-      }
+      //}
       digitalWrite(DIG_OUT_1, LOW);//MAINS OFF
       digitalWrite(EVSE_ACTIVATE, LOW);   // Tell the EVSE to stop providing power
       digitalWrite(CHARGER1_ACTIVATE, LOW); //chargeph1 deactivate
@@ -585,8 +575,16 @@ void loop()
       state = 0;
       bChargerEnabled = false;
 
-      // Turn the LED indicator light 
+      // Turn the LED indicator light off
       digitalWrite(LED_BUILTIN, LOW);
+
+      // Only if debug is set
+      if (debug != 0)
+      {
+        Serial.println();
+        Serial.println("[STATE CHANGE] State = 0 ");
+      }
+      
       break;
 
     // Request to change Charger to an ON state
@@ -648,6 +646,13 @@ void loop()
 
         // Turn the LED indicator light 
         digitalWrite(LED_BUILTIN, HIGH);
+
+         // Only if debug is set
+        if (debug != 0)
+        {
+          Serial.println();
+          Serial.println("[STATE CHANGE] State = 1 ");
+        }
       }
       break;
 
@@ -703,6 +708,14 @@ void loop()
   
         // DEBUG Should 'tboot' be set here? instead of in multiple other locations?
         tboot = millis();   // Set the time at which the chargers were instructed to enable
+
+         // Only if debug is set
+        if (debug != 0)
+        {
+          Serial.println();
+          Serial.println("[STATE CHANGE] State = 2 ");
+        }
+
       }
       break;    // Missing in prior code, but no ill-effects
 
@@ -710,12 +723,20 @@ void loop()
       // Check that 500ms has passed since state = 2 (signal to start enabling) was set
       if (state == 2)
       {
-        if (tboot <  (millis() - 500))
+        state = 3;
+
+         // Only if debug is set
+        if (debug != 0)
         {
-          // After 500ms okay to start the ACTIVATE module process
-          reqdstate = 1;
-          bChargerEnabled = true;
+          Serial.println();
+          Serial.println("[STATE CHANGE] State = 3 ");
         }
+      }
+      if (tboot <  (millis() - 500))
+      {
+        // After 500ms okay to start the ACTIVATE module process
+        reqdstate = 1;
+        bChargerEnabled = true;
       }
       break;
 
