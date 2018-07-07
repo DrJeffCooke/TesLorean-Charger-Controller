@@ -48,7 +48,8 @@ byte Proximity = 0;   // Proximity line enumeration (see below) : voltage set by
 #define Unconnected 0 // 3.3V
 #define Buttonpress 1 // 2.3V
 #define Connected 2 // 1.35V
-uint16_t cablelim = 0; // Power connection (Type 2 only) cable limit as indicated by Proximity
+uint16_t cablelim = 0;    // Power connection (Type 2 only) cable limit as indicated by Proximity
+uint16_t pilotgap = 1200; // If Pilot response gap is longer than 1.2secs then shutdown 
 // Pilot EVSE variables
 volatile uint32_t pilottimer = 0;         // Used to calculate the duty cycle on the Pilot line, duty cycle indicates AC current limit
 volatile uint16_t timehigh, duration = 0; // 'timehigh' is an unused variable, 'duration' is used in Pilot duty cycle calculation
@@ -147,7 +148,7 @@ void setup()
     parameters.mainsRelay = 48;           // ?BUG? variable is not referenced in the code. It may refer to the line on the microcontroller that outputs to the main s relay
     
     // TesLorean Configuration
-    parameters.currReq = 4500;            // max current input limit per module, note: 1500 = 1A, 4500 = 3A
+    parameters.currReq = 7500;            // max current input limit per module, note: 1500 = 1A, 7500 = 5A
     parameters.voltSet = maxhivolts;      // 1 = 0.01V
     parameters.phaseconfig = Singlephase; //AC input configuration (US=Singlephase, EU=Threephase)
     parameters.type = 1;                  // Socket type1 or 2. Note Type 1 is J1772 USA
@@ -516,7 +517,7 @@ void loop()
     Serial.println();
   }
 
-  // When under CanControl and for ElCon/Slave modes, check that a minimum amount of time (500ms) hasn't passed since 'tcan' was set?
+  // When under CanControl and for just ElCon/Slave modes, check that a minimum amount of time (500ms) hasn't passed since 'tcan' was set?
   // If more than 500ms, set the flag to shutdown charging - the CAN has timed out
   if (parameters.canControl > 1)
   {
@@ -555,6 +556,13 @@ void loop()
     // Request to move Charger to an OFF state
     case 0: 
 
+      // Only if debug is set and new state
+      if (debug != 0 && reqdstate != state)
+      {
+        Serial.println();
+        Serial.println("[STATE CHANGE] State = 0 ");
+      }
+
       // ?PRIOR? - Send the deactivate, disable commands on every loop.  May be required behavior.
 
       // Check that the chargers are currently enabled
@@ -578,13 +586,6 @@ void loop()
       // Turn the LED indicator light off
       digitalWrite(LED_BUILTIN, LOW);
 
-      // Only if debug is set
-      if (debug != 0)
-      {
-        Serial.println();
-        Serial.println("[STATE CHANGE] State = 0 ");
-      }
-      
       break;
 
     // Request to change Charger to an ON state
@@ -635,6 +636,13 @@ void loop()
             // default is optional
             break;
         }
+
+        // Only if debug is set and new state
+        if (debug != 0 && reqdstate != state)
+        {
+          Serial.println();
+          Serial.println("[STATE CHANGE] State = 1 ");
+        }
         
         // Flag that the chargers are active
         state = 1;
@@ -646,13 +654,6 @@ void loop()
 
         // Turn the LED indicator light 
         digitalWrite(LED_BUILTIN, HIGH);
-
-         // Only if debug is set
-        if (debug != 0)
-        {
-          Serial.println();
-          Serial.println("[STATE CHANGE] State = 1 ");
-        }
       }
       break;
 
@@ -696,6 +697,14 @@ void loop()
             // if nothing else matches, do the default
             break;
         }
+ 
+        // Only if debug is set and new state
+        if (debug != 0 && reqdstate != state)
+        {
+          Serial.println();
+          Serial.println("[STATE CHANGE] State = 2 ");
+        }
+
         // Update the state
         state = 2;
         
@@ -759,26 +768,22 @@ void loop()
       Serial.print(millis());
       Serial.print(" | State = ");
       Serial.print(state);
-      Serial.print(" | Phases = ");
-      Serial.print(parameters.phaseconfig);
+      // Serial.print(" | Phases = ");
+      // Serial.print(parameters.phaseconfig);
       if (bChargerEnabled) {Serial.print(" | Chargers ON");}
       else {Serial.print(" | Chargers OFF");}
       if (digitalRead(DIG_IN_1) == HIGH) {Serial.print(" | EnableLine Hi");}
       else {Serial.print(" | EnableLine Lo");}
-      /*
-        Serial.print(" AC limit : ");
-        Serial.print(accurlim);
-      */
+      Serial.print(" AC limit (1500=1A) : ");
+      Serial.print(accurlim);
       Serial.print(" | Cable Limit = ");
       Serial.print(cablelim);
-      Serial.print(" | Module Cur Request: ");
+      Serial.print(" | Module Cur Request = ");
       Serial.print(modulelimcur / 1.5, 0);
-      /*
-        Serial.print(" DC AC Cur Lim: ");
-        Serial.print(dcaclim);
-        Serial.print(" Active: ");
-        Serial.print(activemodules);
-      */
+      Serial.print(" | DC AC Cur Lim = ");
+      Serial.print(dcaclim);
+      Serial.print(" | Active =  ");
+      Serial.print(activemodules);
       Serial.print(" | DC total Cur = ");
       Serial.print(totdccur * 0.005, 2);
       Serial.print(" | DC Setpoint = ");
@@ -894,7 +899,7 @@ void loop()
       // ?? Isn't this taken care of in the 'state=0' code ??
       digitalWrite(EVSE_ACTIVATE, LOW);
 
-      if (debugevse != 0){Serial.println("[EVSE] Requesting shutdown (state=0)");}
+      if (debugevse != 0  && state != reqdstate){Serial.println("[EVSE] Requesting shutdown (state=0)");}
 
     }
   }
@@ -1652,7 +1657,7 @@ void Pilotread()
 void Pilotcalc()
 {
   // If the PILOT is high, just calc time since last checked HIGH, else if LOW ???
-  if (  digitalRead(EVSE_PILOT ) == HIGH)
+  if (digitalRead(EVSE_PILOT ) == HIGH)
   {
     duration = micros() - pilottimer;
     pilottimer = micros();
@@ -1660,7 +1665,8 @@ void Pilotcalc()
   else
   {
     //Calculate the duty cycle then multiply by 600 to get mA current limit
-    accurlim = (micros() - pilottimer) * 100 / duration * 600; 
+    // accurlim = (micros() - pilottimer) * 100 / duration * 600; No need to "* 100"
+    accurlim = (micros() - pilottimer) / duration * 60;
   }
 }
 
@@ -1672,7 +1678,7 @@ void ACcurrentlimit()
   if (parameters.autoEnableCharger == 1)
   {
     //too big a gap in pilot signal means signal error, kill or disconnected so no current allowed
-    if (micros() - pilottimer > 1200) 
+    if (micros() - pilottimer > pilotgap) 
     {
       accurlim = 0;
     }
@@ -1708,9 +1714,9 @@ void ACcurrentlimit()
   }
 
   // If in canControl model for Master or ElconMaster
-  if (parameters.canControl == 1 |parameters.canControl == 2)
+  if (parameters.canControl == 1 || parameters.canControl == 2)
   {
-    if (accurlim * 1.5 > (16000 * 1.5)) //enable second charger if current available >15A
+    if (accurlim * 1.5 > (16000 * 1.5)) //enable second charger if current available >15A // ?REDUNDANT? Multiplication * 1.5
     {
       modulelimcur = modulelimcur * 0.5;
 
