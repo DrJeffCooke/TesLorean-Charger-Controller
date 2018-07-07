@@ -1666,7 +1666,10 @@ void Pilotcalc()
   {
     //Calculate the duty cycle then multiply by 600 to get mA current limit
     // accurlim = (micros() - pilottimer) * 100 / duration * 600; No need to "* 100"
-    accurlim = (micros() - pilottimer) / duration * 60;
+    if (pilottimer !=0)
+    {
+      accurlim = (micros() - pilottimer) / duration * 60;
+    }
   }
 }
 
