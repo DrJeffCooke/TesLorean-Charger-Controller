@@ -26,6 +26,7 @@ template<class T> inline Print &operator <<(Print &obj, T arg) {
 int debugevse = 1;  // 1 = show Proximity status and Pilot current limmits
 int debug = 1;      // 1 = show phase module CAN feedback
 int candebug = 1;   // show CAN updates and timeouts
+int debugmsgfreq = 500; // number of ms between general debug outputs
 
 //*********GENERAL VARIABLE   DATA ******************
 uint16_t curset = 0;  // ?BUG? - variable not found in the code
@@ -49,12 +50,14 @@ byte Proximity = 0;   // Proximity line enumeration (see below) : voltage set by
 #define Buttonpress 1 // 2.3V
 #define Connected 2 // 1.35V
 uint16_t cablelim = 0;    // Power connection (Type 2 only) cable limit as indicated by Proximity
-uint16_t pilotgap = 1200; // If Pilot response gap is longer than 1.2secs then shutdown 
+volatile uint32_t pilotgap = 1000000; // microseconds (1000 micros = 1 millisec) If Pilot response gap is longer than 1.0 seconds
 // Pilot EVSE variables
 volatile uint32_t pilottimer = 0;         // Used to calculate the duty cycle on the Pilot line, duty cycle indicates AC current limit
 volatile uint16_t timehigh, duration = 0; // 'timehigh' is an unused variable, 'duration' is used in Pilot duty cycle calculation
 volatile uint16_t accurlim = 0;           // AC current limit calculated from the Pilot line
 volatile int dutycycle = 0;               // Calculated duty cycle of the Pilot line
+bool bPilotTimeout;                       // Flag set if the pilot squarewave times out
+uint16_t enablechargerswait = 2000;       // How many ms to wait from time of enabling chargers to activating
 
 //*********Single or Three Phase Config VARIABLE   DATA ******************
 // Power Source configuration
@@ -63,16 +66,22 @@ volatile int dutycycle = 0;               // Calculated duty cycle of the Pilot 
 
 //*********Charger Control VARIABLE   DATA ******************
 bool Vlimmode = true;                 // ?UNUSED? - Set charges to voltage limit mode
+// modulelimcur is the mA (scaled * 1.5) requested for charging for each single module
+// dcaclim is the max mA limit (per module) that the ACcurrent should be at to limit the DCcurrent to the max
 uint16_t modulelimcur, dcaclim = 0;
-uint16_t maxaccur = 16000;            // set maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
-uint16_t maxdccur = 45000;            // max DC current output in mA
+// set maximum AC current in mA (only used to initially set 'dcaclim' in setup) Modules max mA is 16,000
+uint16_t maxaccur = 16000;            
+// Used to set the maxACcurrent = depends on DCvoltage, ACvoltage and maxACcurrent per module
+// maxdccur = (16000 (maxDCcurrentpermodule) * 3 (three modules) * ACvoltage / DCvoltage) - 400
+// Suspect the '400' is a safety factor as the DCvolts vary (ACvolts should be consistent)
+uint16_t maxdccur = 28000;            
 // activemodules = count of modules that are enabled and active
 // slavechargerenable = 0 slave charger not recruited, 1 slave charger recruited (if charge request is > 15A), says nothing about slave being present
 int activemodules, slavechargerenable = 0;
 // For validation checks
 uint16_t maxhiaccur = maxaccur;            // maximum AC current in mA (only iused to initially set 'dcaclim' in setup)
 uint16_t maxhidccur = maxdccur;            // maximum limit DC current output in mA
-uint16_t maxhivolts = 40000;               // set to 400v; maximum limit Voltage in 0.01V (hundredths of a volt)
+uint16_t maxhivolts = 40000;               // set to 405v; maximum limit Voltage in 0.01V (hundredths of a volt)
 
 //*********Feedback from charge VARIABLE   DATA ******************
 uint16_t dcvolt[3] = {0, 0, 0};       //DC Voltage, 1 = 1V
@@ -148,12 +157,12 @@ void setup()
     parameters.mainsRelay = 48;           // ?BUG? variable is not referenced in the code. It may refer to the line on the microcontroller that outputs to the main s relay
     
     // TesLorean Configuration
-    parameters.currReq = 7500;            // max current input limit per module, note: 1500 = 1A, 7500 = 5A
+    parameters.currReq = 15000;            // max current input limit per module, note: 1500 = 1A, 7500 = 5A, 15000 = 10A
     parameters.voltSet = maxhivolts;      // 1 = 0.01V
     parameters.phaseconfig = Singlephase; //AC input configuration (US=Singlephase, EU=Threephase)
     parameters.type = 1;                  // Socket type1 or 2. Note Type 1 is J1772 USA
-    parameters.autoEnableCharger = 1;     // 1 = enabled, 0 = disabled auto start, with proximity and pilot control
-    parameters.canControl = 1;            // 0 = disabled can control, or in the following modes 1 = master, 2 = Elcon master, 3 = slave
+    parameters.autoEnableCharger = 0;     // 1 = enabled, 0 = disabled auto start, with proximity and pilot control
+    parameters.canControl = 0;            // 0 = disabled can control, or in the following modes 1 = master, 2 = Elcon master, 3 = slave
                                           // Master mode also accommodates a Slave charger (i.e. sends Slave CAN instructions every 100ms)
     parameters.dcdcsetpoint = 14000;      // voltage setpoint for DCDC Converter in mv (sent via external CAN to DCDC)
 
@@ -214,7 +223,8 @@ void setup()
   // Set the maximum AC current
   dcaclim = maxaccur;
 
-  bChargerEnabled = false; //  ?FIXED? are we supposed to command the charger to charge?
+  bChargerEnabled = false;  // ?FIXED? are we supposed to command the charger to charge?
+  bPilotTimeout = false;    // Flag to indicate if pilot error detected during interrupt service 
 }
 
 // MAIN LOOP TASKS
@@ -261,12 +271,12 @@ void loop()
           if (parameters.autoEnableCharger > 1)
           {
             parameters.autoEnableCharger = 0;
-            Serial.println("Error : Autostart selections are 'a' followed by 0 or 1.");
+            Serial.println("[SERIAL] Error : Autostart selections are 'a' followed by 0 or 1.");
           }
           setting = 1;
           // Confirmation message
-          if (parameters.autoEnableCharger == 0){Serial.println("Info : Autostart disabled.");}
-          else {Serial.println("Info : Autostart enabled.");}
+          if (parameters.autoEnableCharger == 0){Serial.println("[SERIAL] Autostart disabled.");}
+          else {Serial.println("[SERIAL] Autostart enabled.");}
         }
         break;
 
@@ -289,13 +299,13 @@ void loop()
           // If the parameter is not 1 or 3, just leave it unchanged
           if (setting == 0)
           {
-            Serial.println("Error : Phase entry must be p1 or p3");
+            Serial.println("[SERIAL] Error : Phase entry must be p1 or p3");
           }
           else
           {
             // Confirmation message
             if ( parameters.phaseconfig == 3){Serial.println("Info : Phase set to 'Three Phase'");}
-            else {Serial.println("Info : Phase set to 'Single Phase'");}
+            else {Serial.println("[SERIAL] Phase set to 'Single Phase'");}
           }
         }
         break;
@@ -316,7 +326,7 @@ void loop()
           // If the parameter is not 1 or 2, just leave it unchanged
           if (setting == 0)
           {
-            Serial.println("Error : Type entry must be t1 or t2");
+            Serial.println("[SERIAL] Error : Type entry must be t1 or t2");
           }
           else
           {
@@ -333,7 +343,7 @@ void loop()
           parameters.canControl = Serial.parseInt();    // returns 0 if no int found
           if (parameters.canControl > 3)
           {
-            Serial.println("Error : CAN control selections are 'x' followed by 0,1,2, or 3.");
+            Serial.println("[SERIAL] Error : CAN control selections are 'x' followed by 0,1,2, or 3.");
             parameters.canControl = 0;
           }
           setting = 1;
@@ -360,16 +370,16 @@ void loop()
               maxdccur = (tempdccur * 1000);
               setting = 1;
               // Confirmation message
-              Serial.println("Info : New setting for Maximum DC Current.");
+              Serial.println("[SERIAL] New setting for Maximum DC Current.");
             }
             else
             {
-              Serial.println("Error : New setting for Maximum DC Current exceeds allowable maximum. Max DC current unchanged.");
+              Serial.println("[SERIAL] Error : New setting for Maximum DC Current exceeds allowable maximum. Max DC current unchanged.");
             }
           }
           else
           {
-            Serial.println("Error : Max DC Current is 'm' followed by a whole number, e.g. 'm45'. Max DC current unchanged.");
+            Serial.println("[SERIAL] Error : Max DC Current is 'm' followed by a whole number, e.g. 'm45'. Max DC current unchanged.");
           }
         }
         break;
@@ -387,16 +397,16 @@ void loop()
             {
               parameters.voltSet = (tempvolt * 100);
               setting = 1;
-              Serial.println("Info : New setting for Voltage.");
+              Serial.println("[SERIAL] New setting for Voltage.");
             }
             else
             {
-              Serial.println("Error : New setting for Voltage exceeds allowable maximum. Max voltage unchanged.");
+              Serial.println("[SERIAL] Error : New setting for Voltage exceeds allowable maximum. Max voltage unchanged.");
             }
           }
           else
           {
-            Serial.println("Error : Set Voltage is 'v' followed by a whole number, e.g. 'v400'. Max voltage unchanged.");
+            Serial.println("[SERIAL] Error : Set Voltage is 'v' followed by a whole number, e.g. 'v400'. Max voltage unchanged.");
           }
         }
         break;
@@ -408,14 +418,14 @@ void loop()
           reqdstate = 2;          // Start the process of enabling and activating the modules
           tboot = millis();   // Set the time at which the 'start' 'stop' command was issued // Now redundant, but harmless
           setting = 1;
-          Serial.println("Info : Initiating Module startup.");
+          Serial.println("[SERIAL] Initiating Module startup.");
         }
         // if currently started (states 1,2,3) - signal to stop
-        if (state > 1)
+        if (state >= 1)
         {
           reqdstate = 0;          // shutdown modules
           setting = 1;
-          Serial.println("Info : Initiating Module shutdown.");
+          Serial.println("[SERIAL] Initiating Module shutdown.");
         }
         break;
 
@@ -430,11 +440,11 @@ void loop()
             parameters.enabledChargers = tempCs;
             setting = 1;
             // Confirmation message
-            Serial.println("Info : Instruction accepted for enabled chargers.");
+            Serial.println("[SERIAL] Instruction accepted for enabled chargers.");
           }
           else
           {
-            Serial.println("Error : To enable chargers enter 'e' followed by 0,1,2,12,13,23, or 123. No changes made to enabled chargers.");
+            Serial.println("[SERIAL] Error : To enable chargers enter 'e' followed by 0,1,2,12,13,23, or 123. No changes made to enabled chargers.");
           }
         }
         break;
@@ -454,11 +464,11 @@ void loop()
               parameters.currReq = tempmaxcur;
               setting = 1;
               // Confirmation message
-              Serial.println("Info : New setting for Current.");
+              Serial.println("[SERIAL] New setting for Current.");
             }
             else
             {
-              Serial.println("Error : New setting for Current exceeds allowable maximum. Max current unchanged.");
+              Serial.println("[SERIAL] Error : New setting for Current exceeds allowable maximum. Max current unchanged.");
             }
           //}
         }
@@ -741,7 +751,8 @@ void loop()
           Serial.println("[STATE CHANGE] State = 3 ");
         }
       }
-      if (tboot <  (millis() - 500))
+      // Check that a time has passed before leaving state 3 and attempting to activate the chargers
+      if (tboot <  (millis() - enablechargerswait))
       {
         // After 500ms okay to start the ACTIVATE module process
         reqdstate = 1;
@@ -755,7 +766,7 @@ void loop()
   }
 
   // Every 500ms output a debug status message
-  if (tlast <  (millis() - 500))
+  if (tlast <  (millis() - debugmsgfreq))
   {
     // mark a new time
     tlast = millis();
@@ -772,13 +783,13 @@ void loop()
       // Serial.print(parameters.phaseconfig);
       if (bChargerEnabled) {Serial.print(" | Chargers ON");}
       else {Serial.print(" | Chargers OFF");}
-      if (digitalRead(DIG_IN_1) == HIGH) {Serial.print(" | EnableLine Hi");}
-      else {Serial.print(" | EnableLine Lo");}
-      Serial.print(" AC limit (1500=1A) : ");
+      if (digitalRead(DIG_IN_1) == HIGH) {Serial.print(" | Enable Hi");}
+      else {Serial.print(" | Enable Lo");}
+      Serial.print(" | AC limit = ");
       Serial.print(accurlim);
       Serial.print(" | Cable Limit = ");
       Serial.print(cablelim);
-      Serial.print(" | Module Cur Request = ");
+      Serial.print(" | Mod Cur Request = ");
       Serial.print(modulelimcur / 1.5, 0);
       Serial.print(" | DC AC Cur Lim = ");
       Serial.print(dcaclim);
@@ -788,6 +799,8 @@ void loop()
       Serial.print(totdccur * 0.005, 2);
       Serial.print(" | DC Setpoint = ");
       Serial.print(parameters.voltSet * 0.01, 0);
+      if (bPilotTimeout) {Serial.print(" | Pilot Timeout");}
+      else {Serial.print(" | Pilot OK");}
       Serial.println();
 
       if (bChargerEnabled)
@@ -870,9 +883,6 @@ void loop()
       //digitalWrite(EVSE_ACTIVATE, HIGH);//pull pilot low to indicate ready - NOT WORKING freezes PWM reading
       if (modulelimcur > 1400) // one amp or more active modules
       {
-        // ?REDUNDANT? 
-        //if (parameters.autoEnableCharger == 1)
-        //{
         if (state == 0)
         {
           if (digitalRead(DIG_IN_1) == HIGH)
@@ -886,7 +896,6 @@ void loop()
 
             if (debugevse != 0){Serial.println("[EVSE] Requesting start-up (state=2)");}
           }
-        //}
         }
       }
       digitalWrite(DIG_OUT_2, HIGH); //enable AC present indication
@@ -1645,7 +1654,7 @@ void evseread()
   }
 }
 
-// Just a shell function
+// Just a shell function ; Interrupt Service Routine for PILOT line square wave signals
 void Pilotread()
 {
   Pilotcalc();
@@ -1659,17 +1668,34 @@ void Pilotcalc()
   // If the PILOT is high, just calc time since last checked HIGH, else if LOW ???
   if (digitalRead(EVSE_PILOT ) == HIGH)
   {
-    duration = micros() - pilottimer;
+    // Check that pilottimer has been updated at least once
+    if (pilottimer!=0)
+    {
+      duration = micros() - pilottimer;
+    }
     pilottimer = micros();
   }
-  else
+  else // Pilot LOW
   {
-    //Calculate the duty cycle then multiply by 600 to get mA current limit
-    // accurlim = (micros() - pilottimer) * 100 / duration * 600; No need to "* 100"
-    // milliamps = dutycycle * 60,000
-    if (pilottimer !=0)
+    if (pilottimer!=0 && duration !=0)
     {
-      accurlim = (micros() - pilottimer) / duration * 60000;
+      // Calculation of the uptime
+      timehigh = micros() - pilottimer;
+
+      // Test to see if timehigh is beyond limits
+      if (timehigh > pilotgap)
+      {
+          // This check previously occurred in ACcurrentlimit()
+          accurlim = 0;
+          bPilotTimeout = true;
+      }
+      else
+      {      
+        //Calculate the duty cycle then multiply by 600 to get mA current limit
+        // accurlim = (micros() - pilottimer) * 100 / duration * 600
+        // milliamps = dutycycle * 60,000... multiply & divide sequence may avoid a value out of range for accurlim
+        accurlim = timehigh * 100 / duration * 600;
+      }
     }
   }
 }
@@ -1681,20 +1707,43 @@ void ACcurrentlimit()
 {
   if (parameters.autoEnableCharger == 1)
   {
-    //too big a gap in pilot signal means signal error, kill or disconnected so no current allowed
-    if (micros() - pilottimer > pilotgap) 
+// DEBUG - This is checking a volatile variable outside of an Interrupt Service Routine (could see byte updated values)
+/*    //too big a gap in pilot signal means signal error, kill or disconnected so no current allowed
+    if (Proximity == Connected)
     {
-      accurlim = 0;
+      // Note : pilottimer is a volatile variable bytes of which could be updated in the middle of this operation
+      if ((micros() - pilottimer) > pilotgap) // This seems to be firing all the time?
+      {
+        accurlim = 0;
+        // Debug
+        // if (debugevse != 0){Serial.println("[EVSE] Warning : Too long a gap in pilot signal.");}
+      }
     }
+    else  // Power is disconnected (Button Pressed or Unconnected)
+    {
+        accurlim = 0;
+        // Debug
+        // if (debugevse != 0){Serial.println("[EVSE] Power withdrawn.");}
+    }
+*/
+
+//////// ?BUG?  ACCURLIM is volatile and could be updated during the ISR Pilotcalc()
+    // Grab the accurlim into a temp variable
+    uint16_t tempaccurlim = 0;
+    noInterrupts();
+    tempaccurlim = accurlim;
+    interrupts();
 
     // Calculate the modulelimcur per module
     if (parameters.phaseconfig == Singlephase)
     {
-      modulelimcur = (accurlim / 3) * 1.5 ; // all module parallel, sharing AC input current
+
+      modulelimcur = (tempaccurlim / 3) * 1.5 ; // all module parallel, sharing AC input current
+
     }
     else // Threephase
     {
-      modulelimcur = accurlim * 1.5; // one module per phase, EVSE current limit is per phase
+      modulelimcur = tempaccurlim * 1.5; // one module per phase, EVSE current limit is per phase
     }
 
     // If Type 2 power source, check if modulelimcur is over limit, and if so set to limit value
@@ -1775,8 +1824,20 @@ void DCcurrentlimit()
     }
   }
   dcaclim = 0;
+
+  // ?BUG/FEATURE? Only referencing the 3rd (0..2) module to calculate the 'dcaccurlim'
+  // Could this cause a problem if not all 3 modules are enabled ??
   int x = 2;
   dcaclim = ((dcvolt[x] * (maxdccur + 400)) / acvolt[x]) / activemodules;
+
+  // Make sure the dcaclim doesn't exceed the maximum mAmps for a single module
+  // Indications suggest that just as AC power is applied, the lower (than normal, i.e. 150 vs 240) ACvoltage will
+  // cause the DCAClim calculation to spike, which may be throwing the modules into FAULT.
+  if (dcaclim > maxaccur)
+  { 
+    // maxaccur should be 16Amps/module
+    dcaclim = maxaccur;
+  }
 }
 
 
